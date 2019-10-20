@@ -15,14 +15,20 @@
 // You should have received a copy of the GNU Lesser General Public
 // License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 //
-// Refactored version of the pulse audio default main loop implementation
-// See pulseaudio src/pulse/mainloop.c and <pulse/mainloop-api.h>
+// Refactored version of the pulse audio default main loop implementation.
+// Seemed nice to me since it has a rather clean and minimal interface,
+// is quite flexible and has no external dependencies.
+// See pulseaudio src/pulse/mainloop.c and <pulse/mainloop-api.h> for
+// the original implementation.
+// Added custom event sources that allow integration with pretty much
+// anything (you could poll multiple event loops like this).
 
 #pragma once
 
 #include <stdbool.h>
+#include <time.h>
 
-struct timeval;
+struct timespec;
 struct pollfd;
 
 struct mainloop;
@@ -31,6 +37,7 @@ void mainloop_prepare(struct mainloop*);
 void mainloop_poll(struct mainloop*);
 void mainloop_dispatch(struct mainloop*);
 void mainloop_iterate(struct mainloop*);
+// struct pollfd* mainloop_get_fds(struct mainloop*, unsigned* count);
 
 struct ml_io;
 struct ml_timer;
@@ -60,12 +67,12 @@ void ml_io_events(struct ml_io*, enum ml_io_flags);
 struct mainloop* ml_io_get_mainloop(struct ml_io*);
 
 // A time event callback prototype
-typedef void (*ml_timer_cb)(struct ml_timer* e, const struct timeval *tv);
+typedef void (*ml_timer_cb)(struct ml_timer* e, const struct timespec *tv);
 // A time event destroy callback prototype
 typedef void (*ml_timer_destroy_cb)(struct ml_timer *e);
 
-struct ml_timer* ml_timer_new(struct mainloop*, const struct timeval *tv, ml_timer_cb);
-void ml_timer_restart(struct ml_timer*, const struct timeval* tv);
+struct ml_timer* ml_timer_new(struct mainloop*, const struct timespec *tv, ml_timer_cb);
+void ml_timer_restart(struct ml_timer*, const struct timespec* tv);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
 void ml_timer_destroy(struct ml_timer*);
@@ -87,11 +94,12 @@ struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
 
 // TODO: add timeout functionality
 struct ml_custom_impl {
+	void (*prepare)(struct ml_custom*);
+	void (*get_fds)(struct ml_custom*, unsigned* count, struct pollfd*);
 	void (*dispatch)(struct ml_custom*, unsigned count, struct pollfd*);
-	void (*prepare)(struct ml_custom*, unsigned* count, struct pollfd*);
 };
 
-struct ml_custom* ml_custom_new(struct mainloop*, const struct ml_custom_impl* impl);
+struct ml_custom* ml_custom_new(struct mainloop*, const struct ml_custom_impl*);
 void ml_custom_set_data(struct ml_custom*, void*);
 void* ml_custom_get_data(struct ml_custom*);
 void ml_custom_destroy(struct ml_custom*);

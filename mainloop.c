@@ -1,7 +1,9 @@
 #include "mainloop.h"
-#include <sys/poll.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <time.h>
+#include <assert.h>
+#include <sys/poll.h>
 
 struct ml_io {
 	struct ml_io* prev;
@@ -41,7 +43,6 @@ struct ml_custom {
 	void* data;
 	const struct ml_custom_impl* impl;
 	unsigned n_fds_last;
-	unsigned fds_start;
 };
 
 struct mainloop {
@@ -59,11 +60,73 @@ struct mainloop {
 	int n_enabled_defered;
 };
 
+static unsigned max(unsigned a, unsigned b) {
+	return a > b ? a : b;
+}
+
+static short map_flags_to_libc(enum ml_io_flags flags) {
+    return (short)
+        ((flags & ml_io_input ? POLLIN : 0) |
+         (flags & ml_io_output ? POLLOUT : 0) |
+         (flags & ml_io_hangup ? POLLERR : 0) |
+         (flags & ml_io_error ? POLLHUP : 0));
+}
+
+static enum ml_io_flags map_flags_from_libc(short flags) {
+    return
+        (flags & POLLIN ? ml_io_input : 0) |
+        (flags & POLLOUT ? ml_io_output : 0) |
+        (flags & POLLERR ? ml_io_error : 0) |
+        (flags & POLLHUP ? ml_io_hangup : 0);
+}
+
 // mainloop
 void mainloop_prepare(struct mainloop* ml) {
-	if(ml->rebuild_fds) {
+	// if there are enabled defer sources, we will simply dispatch
+	// those and not care about the rest
+	if(ml->n_enabled_defered) {
+		return;
+	}
+
+	// prepare custom sources
+	unsigned n_fds = ml->n_io;
+	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
+		assert(c->impl->prepare);
+		c->impl->prepare(c);
+		unsigned count = 0;
+		struct pollfd* fds = NULL;
+		if(!ml->rebuild_fds && n_fds < ml->n_fds) {
+			fds = &ml->fds[n_fds];
+			count = ml->n_fds - n_fds;
+		}
+
+		assert(c->impl->get_fds);
+		c->impl->get_fds(c, &count, fds);
+		c->n_fds_last = n_fds;
+		n_fds += count;
+	}
+
+	// rebuild fds if needed
+	if(ml->rebuild_fds || n_fds > ml->n_fds) {
 		ml->rebuild_fds = false;
-		// TODO
+		ml->fds = realloc(ml->fds, n_fds * sizeof(*ml->fds));
+		ml->n_fds = n_fds;
+
+		unsigned i = 0u;
+		for(struct ml_io* io = ml->io_list; io; io = io->next) {
+			ml->fds[i].fd = io->fd;
+			ml->fds[i].events = io->events;
+			++i;
+		}
+
+		for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
+			unsigned count = c->n_fds_last;
+			assert(c->impl->get_fds);
+			c->impl->get_fds(c, &count, &ml->fds[i]);
+			assert(count == c->n_fds_last &&
+				"Custom event source changed number of fds without prepare");
+			i += count;
+		}
 	}
 }
 
@@ -72,19 +135,56 @@ void mainloop_poll(struct mainloop* ml) {
 		return;
 	}
 
-	int timeout = -1;
+	int timeout = -1; // TODO
 	int ret = poll(ml->fds, ml->n_io, timeout);
+	// TODO
 }
 
 void mainloop_dispatch(struct mainloop* ml) {
 	if(ml->n_enabled_defered) {
-		// dispatch deferred
+		for(struct ml_defer* d = ml->defer_list; d; d = d->next) {
+			if(d->enabled) {
+				assert(d->cb);
+				d->cb(d);
+			}
+		}
+
+		// if there were any deferred events enabled, we didn't ever
+		// poll or wait for any timeout and therefore don't have
+		// to dispatch any other sources
 		return;
 	}
 
 	// dispatch time events
-	// dispatch io events
-	// dispatch custom events
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	// TODO, wip
+	for(struct ml_timer* t = ml->timer_list; t; t = t->next) {
+		if(t->time <= now) {
+			assert(t->cb);
+			t->cb(t, now);
+		}
+	}
+
+	// dispatch pollfds
+	struct pollfd* fd = ml->fds;
+
+	// io events
+	for(struct ml_io* io = ml->io_list; io; io = io->next) {
+		if(fd->revents) {
+			assert(io->cb);
+			io->cb(io, map_flags_from_libc(fd->revents));
+		}
+		++fd;
+	}
+
+	// custom events
+	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
+		assert(c->impl->dispatch);
+		c->impl->dispatch(c, c->n_fds_last, fd);
+		fd += c->n_fds_last;
+	}
 }
 
 void mainloop_iterate(struct mainloop* ml) {
@@ -156,8 +256,8 @@ struct mainloop* ml_io_get_mainloop(struct ml_io* io) {
 	return io->mainloop;
 }
 
-struct ml_timer* ml_timer_new(struct mainloop*, const struct timeval *tv, ml_timer_cb);
-void ml_timer_restart(struct ml_timer*, const struct timeval* tv);
+struct ml_timer* ml_timer_new(struct mainloop*, const struct timespec *tv, ml_timer_cb);
+void ml_timer_restart(struct ml_timer*, const struct timespec* tv);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
 void ml_timer_destroy(struct ml_timer*);
