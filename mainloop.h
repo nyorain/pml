@@ -34,9 +34,9 @@ struct pollfd;
 struct mainloop;
 
 void mainloop_prepare(struct mainloop*);
-void mainloop_poll(struct mainloop*);
+int mainloop_poll(struct mainloop*);
 void mainloop_dispatch(struct mainloop*);
-void mainloop_iterate(struct mainloop*);
+int mainloop_iterate(struct mainloop*);
 // struct pollfd* mainloop_get_fds(struct mainloop*, unsigned* count);
 
 struct ml_io;
@@ -52,9 +52,7 @@ enum ml_io_flags {
     ml_io_error = 8
 };
 
-// An IO event callback prototype
 typedef void (*ml_io_cb)(struct ml_io* e, enum ml_io_flags revents);
-// A IO event destroy callback prototype
 typedef void (*ml_io_destroy_cb)(struct ml_io *e);
 
 struct ml_io* ml_io_new(struct mainloop*, int fd, enum ml_io_flags events, ml_io_cb);
@@ -66,22 +64,22 @@ void ml_io_set_destroy_db(struct ml_io*, ml_io_destroy_cb);
 void ml_io_events(struct ml_io*, enum ml_io_flags);
 struct mainloop* ml_io_get_mainloop(struct ml_io*);
 
-// A time event callback prototype
-typedef void (*ml_timer_cb)(struct ml_timer* e, const struct timespec *tv);
-// A time event destroy callback prototype
+// ml_timer
+// The passed timerspec values represent the timepoints using CLOCK_REALTIME
+// at which the timer should be triggered. They don't represent intervals.
+// TODO: support other clocks
+typedef void (*ml_timer_cb)(struct ml_timer* e, const struct timespec*);
 typedef void (*ml_timer_destroy_cb)(struct ml_timer *e);
 
-struct ml_timer* ml_timer_new(struct mainloop*, const struct timespec *tv, ml_timer_cb);
-void ml_timer_restart(struct ml_timer*, const struct timespec* tv);
+struct ml_timer* ml_timer_new(struct mainloop*, const struct timespec*, ml_timer_cb);
+void ml_timer_restart(struct ml_timer*, const struct timespec*);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
 void ml_timer_destroy(struct ml_timer*);
 void ml_timer_set_destroy_db(struct ml_timer*, ml_timer_destroy_cb);
 struct mainloop* ml_timer_get_mainloop(struct ml_timer*);
 
-// A defer event callback prototype
 typedef void (*ml_defer_cb)(struct ml_defer* e);
-// A defer event destroy callback prototype
 typedef void (*ml_defer_destroy_cb)(struct ml_defer *e);
 
 struct ml_defer* ml_defer_new(struct mainloop*, ml_defer_cb);
@@ -89,7 +87,7 @@ void ml_defer_enable(struct ml_defer*, bool enable);
 void ml_defer_set_data(struct ml_defer*, void*);
 void* ml_defer_get_data(struct ml_defer*);
 void ml_defer_destroy(struct ml_defer*);
-void ml_defer_set_destroy_db(struct ml_defer*, ml_timer_destroy_cb);
+void ml_defer_set_destroy_db(struct ml_defer*, ml_defer_destroy_cb);
 struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
 
 // TODO: add timeout functionality
