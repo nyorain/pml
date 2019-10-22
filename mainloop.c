@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 201710L
+
 #include "mainloop.h"
 #include <stdlib.h>
 #include <limits.h>
@@ -11,12 +13,8 @@
 
 // TODO: implement the various caches and optimizations that
 // keep track of timeouts etc
-// TODO: some of the dead+cleanup mechanisms are probably needed
-// to allow destroying sources from inside callback handlers.
-// with some additional constraints (e.g. no destruction of other
-// event sources from within custom_impl.prepare/get_fds) we
-// might also get away with just using safe llist iteration, right?
-// the dead+cleanup mechanism sounds better though i guess
+// TODO: keep track of state (prepared/polled/init) in mainloop
+// to assert those functions are used correctly?
 
 struct ml_io {
 	struct ml_io* prev;
@@ -28,6 +26,7 @@ struct ml_io {
 	int fd;
 	enum ml_io_flags events;
 	unsigned fd_id;
+	bool dead;
 };
 
 struct ml_timer {
@@ -39,6 +38,7 @@ struct ml_timer {
 	void* data;
 	ml_timer_cb cb;
 	ml_timer_destroy_cb destroy_cb;
+	bool dead;
 };
 
 struct ml_defer {
@@ -49,6 +49,7 @@ struct ml_defer {
 	ml_defer_cb cb;
 	ml_defer_destroy_cb destroy_cb;
 	bool enabled;
+	bool dead;
 };
 
 struct ml_custom {
@@ -58,10 +59,11 @@ struct ml_custom {
 	void* data;
 	const struct ml_custom_impl* impl;
 	unsigned n_fds_last;
+	bool dead;
 };
 
 struct mainloop {
-	unsigned n_io;
+	unsigned n_io; // only alive ones
 	unsigned n_fds;
 	struct pollfd* fds;
 
@@ -75,11 +77,16 @@ struct mainloop {
 
 	int64_t prepared_timeout;
 	int poll_ret;
+
+	int n_dead_custom;
+	int n_dead_io;
+	int n_dead_timer;
+	int n_dead_defer;
 };
 
-static unsigned max(unsigned a, unsigned b) {
-	return a > b ? a : b;
-}
+// static unsigned max(unsigned a, unsigned b) {
+// 	return a > b ? a : b;
+// }
 
 static short map_flags_to_libc(enum ml_io_flags flags) {
     return (short)
@@ -106,15 +113,178 @@ static void timespec_subtract(struct timespec* a, const struct timespec* minus) 
 	a->tv_sec -= minus->tv_sec;
 }
 
-static int64_t timespec_ms_from_now(const struct timespec* t) {
-	struct timespec diff;
-	clock_gettime(CLOCK_REALTIME, &diff);
-	timespec_subtract(&diff, t);
-	return -timespec_ms(&diff);
+// static int64_t timespec_ms_from_now(const struct timespec* t) {
+// 	struct timespec diff;
+// 	clock_gettime(CLOCK_REALTIME, &diff);
+// 	timespec_subtract(&diff, t);
+// 	return -timespec_ms(&diff);
+// }
+
+static void cleanup_io(struct mainloop* ml) {
+	for(struct ml_io* io = ml->io_list; io && ml->n_dead_io > 0;) {
+		if(!io->dead) {
+			io = io->next;
+			continue;
+		}
+
+		if(io->destroy_cb) {
+			io->destroy_cb(io);
+		}
+		if(io->next) {
+			io->next->prev = io->prev;
+		}
+		if(io->prev) {
+			io->prev->next = io->next;
+		}
+		if(io == io->mainloop->io_list) {
+			io->mainloop->io_list = io->next;
+		}
+
+		--ml->n_dead_io;
+		struct ml_io* next = io->next;
+		free(io);
+		io = next;
+	}
+
+	assert(ml->n_dead_io == 0);
+}
+
+static void cleanup_timer(struct mainloop* ml) {
+	for(struct ml_timer* t = ml->timer_list; t && ml->n_dead_timer > 0;) {
+		if(!t->dead) {
+			t = t->next;
+			continue;
+		}
+
+		if(t->destroy_cb) {
+			t->destroy_cb(t);
+		}
+		if(t->next) {
+			t->next->prev = t->prev;
+		}
+		if(t->prev) {
+			t->prev->next = t->next;
+		}
+		if(t == t->mainloop->timer_list) {
+			t->mainloop->timer_list = t->next;
+		}
+
+		--ml->n_dead_timer;
+		struct ml_timer* next = t->next;
+		free(t);
+		t = next;
+	}
+
+	assert(ml->n_dead_timer == 0);
+}
+
+static void cleanup_defer(struct mainloop* ml) {
+	for(struct ml_defer* d = ml->defer_list; d && ml->n_dead_defer > 0;) {
+		if(!d->dead) {
+			d = d->next;
+			continue;
+		}
+
+		if(d->destroy_cb) {
+			d->destroy_cb(d);
+		}
+		if(d->next) {
+			d->next->prev = d->prev;
+		}
+		if(d->prev) {
+			d->prev->next = d->next;
+		}
+		if(d == d->mainloop->defer_list) {
+			d->mainloop->defer_list = d->next;
+		}
+
+		--ml->n_dead_defer;
+		struct ml_defer* next = d->next;
+		free(d);
+		d = next;
+	}
+
+	assert(ml->n_dead_defer == 0);
+}
+
+static void cleanup_custom(struct mainloop* ml) {
+	for(struct ml_custom* c = ml->custom_list; c && ml->n_dead_custom > 0;) {
+		if(!c->dead) {
+			c = c->next;
+			continue;
+		}
+
+		if(c->next) {
+			c->next->prev = c->prev;
+		}
+		if(c->prev) {
+			c->prev->next = c->next;
+		}
+		if(c == c->mainloop->custom_list) {
+			c->mainloop->custom_list = c->next;
+		}
+
+		--ml->n_dead_custom;
+		struct ml_custom* next = c->next;
+		free(c);
+		c = next;
+	}
+
+	assert(ml->n_dead_custom == 0);
 }
 
 // mainloop
+struct mainloop* mainloop_create(void) {
+	struct mainloop* ml = calloc(1, sizeof(*ml));
+	return ml;
+}
+
+void mainloop_destroy(struct mainloop* ml) {
+	if(!ml) {
+		return;
+	}
+
+	// free all sources
+	for(struct ml_custom* c = ml->custom_list; c;) {
+		struct ml_custom* n = c->next;
+		free(c);
+		c = n;
+	}
+	for(struct ml_io* c = ml->io_list; c;) {
+		if(c->destroy_cb) {
+			c->destroy_cb(c);
+		}
+		struct ml_io* n = c->next;
+		free(c);
+		c = n;
+	}
+	for(struct ml_defer* c = ml->defer_list; c;) {
+		if(c->destroy_cb) {
+			c->destroy_cb(c);
+		}
+		struct ml_defer* n = c->next;
+		free(c);
+		c = n;
+	}
+	for(struct ml_timer* c = ml->timer_list; c;) {
+		if(c->destroy_cb) {
+			c->destroy_cb(c);
+		}
+		struct ml_timer* n = c->next;
+		free(c);
+		c = n;
+	}
+
+	free(ml);
+}
+
 void mainloop_prepare(struct mainloop* ml) {
+	// cleanup dead sources
+	cleanup_io(ml);
+	cleanup_timer(ml);
+	cleanup_defer(ml);
+	cleanup_custom(ml);
+
 	// if there are enabled defer sources, we will simply dispatch
 	// those and not care about the rest
 	if(ml->n_enabled_defered) {
@@ -167,7 +337,7 @@ void mainloop_prepare(struct mainloop* ml) {
 		unsigned i = 0u;
 		for(struct ml_io* io = ml->io_list; io; io = io->next) {
 			ml->fds[i].fd = io->fd;
-			ml->fds[i].events = io->events;
+			ml->fds[i].events = map_flags_to_libc(io->events);
 			++i;
 		}
 
@@ -226,8 +396,8 @@ void mainloop_dispatch(struct mainloop* ml) {
 		timespec_subtract(&diff, &now);
 		if(timespec_ms(&diff) <= 0) {
 			assert(t->cb);
-			t->cb(t, &t->time);
 			t->enabled = false;
+			t->cb(t, &t->time);
 		}
 	}
 
@@ -305,23 +475,11 @@ void ml_io_destroy(struct ml_io* io) {
 	if(!io) {
 		return;
 	}
-	if(io->destroy_cb) {
-		io->destroy_cb(io);
-	}
 
-	if(io->next) {
-		io->next->prev = io->prev;
-	}
-	if(io->prev) {
-		io->prev->next = io->next;
-	}
-	if(io == io->mainloop->io_list) {
-		io->mainloop->io_list = io->next;
-	}
-
+	io->dead = true;
 	--io->mainloop->n_io;
+	++io->mainloop->n_dead_io;
 	io->mainloop->rebuild_fds = true;
-	free(io);
 }
 
 void ml_io_set_destroy_db(struct ml_io* io, ml_io_destroy_cb dcb) {
@@ -377,22 +535,9 @@ void ml_timer_destroy(struct ml_timer* timer) {
 		return;
 	}
 
-	if(timer->destroy_cb) {
-		timer->destroy_cb(timer);
-	}
-
-	// unlink
-	if(timer->next) {
-		timer->next->prev = timer->prev;
-	}
-	if(timer->prev) {
-		timer->prev->next = timer->next;
-	}
-	if(timer == timer->mainloop->timer_list) {
-		timer->mainloop->timer_list = timer->next;
-	}
-
-	free(timer);
+	timer->enabled = false;
+	timer->dead = true;
+	++timer->mainloop->n_dead_timer;
 }
 
 void ml_timer_set_destroy_db(struct ml_timer* timer, ml_timer_destroy_cb dcb) {
@@ -446,23 +591,11 @@ void ml_defer_destroy(struct ml_defer* defer) {
 	}
 	if(defer->enabled) {
 		--defer->mainloop->n_enabled_defered;
-	}
-	if(defer->destroy_cb) {
-		defer->destroy_cb(defer);
+		defer->enabled = false;
 	}
 
-	// unlink
-	if(defer->next) {
-		defer->next->prev = defer->prev;
-	}
-	if(defer->prev) {
-		defer->prev->next = defer->next;
-	}
-	if(defer == defer->mainloop->defer_list) {
-		defer->mainloop->defer_list = defer->next;
-	}
-
-	free(defer);
+	defer->dead = true;
+	++defer->mainloop->n_dead_defer;
 }
 void ml_defer_set_destroy_db(struct ml_defer* defer, ml_defer_destroy_cb dcb) {
 	defer->destroy_cb = dcb;
@@ -499,18 +632,8 @@ void ml_custom_destroy(struct ml_custom* custom) {
 		return;
 	}
 
-	// unlink
-	if(custom->prev) {
-		custom->prev->next = custom->next;
-	}
-	if(custom->next) {
-		custom->next->prev = custom->prev;
-	}
-	if(custom == custom->mainloop->custom_list) {
-		custom->mainloop->custom_list = custom->next;
-	}
-
-	free(custom);
+	custom->dead = true;
+	++custom->mainloop->n_dead_custom;
 }
 
 struct mainloop* ml_custom_get_mainloop(struct ml_custom* custom) {

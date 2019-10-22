@@ -33,6 +33,11 @@ struct pollfd;
 
 struct mainloop;
 
+struct mainloop* mainloop_create(void);
+// destroying the mainloop will automatically destroy all sources.
+// They must not be used anymore after this.
+void mainloop_destroy(struct mainloop*);
+
 void mainloop_prepare(struct mainloop*);
 int mainloop_poll(struct mainloop*);
 void mainloop_dispatch(struct mainloop*);
@@ -90,6 +95,7 @@ void ml_defer_destroy(struct ml_defer*);
 void ml_defer_set_destroy_db(struct ml_defer*, ml_defer_destroy_cb);
 struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
 
+// TODO: add destroy impl function?
 // TODO: add timeout functionality
 struct ml_custom_impl {
 	void (*prepare)(struct ml_custom*);
