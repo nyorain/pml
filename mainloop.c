@@ -296,7 +296,7 @@ void mainloop_prepare(struct mainloop* ml) {
 	struct timespec now;
 	clock_gettime(CLOCK_REALTIME, &now);
 	for(struct ml_timer* t = ml->timer_list; t; t = t->next) {
-		if(!t->enabled) {
+		if(t->dead || !t->enabled) {
 			continue;
 		}
 
@@ -313,6 +313,10 @@ void mainloop_prepare(struct mainloop* ml) {
 	// prepare custom sources
 	unsigned n_fds = ml->n_io;
 	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
+		if(c->dead) {
+			continue;
+		}
+
 		assert(c->impl->prepare);
 		c->impl->prepare(c);
 		unsigned count = 0;
@@ -336,12 +340,20 @@ void mainloop_prepare(struct mainloop* ml) {
 
 		unsigned i = 0u;
 		for(struct ml_io* io = ml->io_list; io; io = io->next) {
+			if(io->dead) {
+				continue;
+			}
+
 			ml->fds[i].fd = io->fd;
 			ml->fds[i].events = map_flags_to_libc(io->events);
 			++i;
 		}
 
 		for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
+			if(c->dead) {
+				continue;
+			}
+
 			unsigned count = c->n_fds_last;
 			assert(c->impl->get_fds);
 			c->impl->get_fds(c, &count, &ml->fds[i]);
@@ -371,7 +383,7 @@ int mainloop_poll(struct mainloop* ml) {
 void mainloop_dispatch(struct mainloop* ml) {
 	if(ml->n_enabled_defered) {
 		for(struct ml_defer* d = ml->defer_list; d; d = d->next) {
-			if(d->enabled) {
+			if(d->enabled && !d->dead) {
 				assert(d->cb);
 				d->cb(d);
 			}
@@ -388,7 +400,7 @@ void mainloop_dispatch(struct mainloop* ml) {
 	clock_gettime(CLOCK_REALTIME, &now);
 
 	for(struct ml_timer* t = ml->timer_list; t; t = t->next) {
-		if(!t->enabled) {
+		if(!t->enabled || t->dead) {
 			continue;
 		}
 
@@ -411,6 +423,10 @@ void mainloop_dispatch(struct mainloop* ml) {
 
 	// io events
 	for(struct ml_io* io = ml->io_list; io; io = io->next) {
+		if(io->dead) {
+			continue;
+		}
+
 		if(fd->revents) {
 			assert(io->cb);
 			io->cb(io, map_flags_from_libc(fd->revents));
@@ -420,6 +436,10 @@ void mainloop_dispatch(struct mainloop* ml) {
 
 	// custom events
 	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
+		if(c->dead) {
+			continue;
+		}
+
 		assert(c->impl->dispatch);
 		c->impl->dispatch(c, c->n_fds_last, fd);
 		fd += c->n_fds_last;
