@@ -33,16 +33,17 @@ struct pollfd;
 
 struct mainloop;
 
-struct mainloop* mainloop_create(void);
+struct mainloop* mainloop_new(void);
 // destroying the mainloop will automatically destroy all sources.
 // They must not be used anymore after this.
 void mainloop_destroy(struct mainloop*);
 
+// returns the prepared timeout
 void mainloop_prepare(struct mainloop*);
+unsigned mainloop_query(struct mainloop*, struct pollfd* fds, unsigned n_fds, int* timeout);
 int mainloop_poll(struct mainloop*);
-void mainloop_dispatch(struct mainloop*);
+void mainloop_dispatch(struct mainloop*, struct pollfd* fds, unsigned n_fds);
 int mainloop_iterate(struct mainloop*);
-// struct pollfd* mainloop_get_fds(struct mainloop*, unsigned* count);
 
 struct ml_io;
 struct ml_timer;
@@ -95,12 +96,15 @@ void ml_defer_destroy(struct ml_defer*);
 void ml_defer_set_destroy_db(struct ml_defer*, ml_defer_destroy_cb);
 struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
 
-// TODO: add destroy impl function?
-// TODO: add timeout functionality
+// ml_custom
 struct ml_custom_impl {
 	void (*prepare)(struct ml_custom*);
-	void (*get_fds)(struct ml_custom*, unsigned* count, struct pollfd*);
-	void (*dispatch)(struct ml_custom*, unsigned count, struct pollfd*);
+	// timeout in milliseconds. Negative value is infinite polling,
+	// zero means that something is already ready.
+	// Returns the number of pollfds available
+	unsigned (*query)(struct ml_custom*, struct pollfd*, unsigned n_fds, int* timeout);
+	void (*dispatch)(struct ml_custom*, struct pollfd*, unsigned n_fds);
+	void (*destroy)(struct ml_custom*); // optional
 };
 
 struct ml_custom* ml_custom_new(struct mainloop*, const struct ml_custom_impl*);

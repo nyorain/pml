@@ -84,6 +84,10 @@ struct mainloop {
 	int n_dead_defer;
 };
 
+static unsigned min(unsigned a, unsigned b) {
+	return a < b ? a : b;
+}
+
 // static unsigned max(unsigned a, unsigned b) {
 // 	return a > b ? a : b;
 // }
@@ -214,6 +218,9 @@ static void cleanup_custom(struct mainloop* ml) {
 			continue;
 		}
 
+		if(c->impl->destroy) {
+			c->impl->destroy(c);
+		}
 		if(c->next) {
 			c->next->prev = c->prev;
 		}
@@ -234,7 +241,7 @@ static void cleanup_custom(struct mainloop* ml) {
 }
 
 // mainloop
-struct mainloop* mainloop_create(void) {
+struct mainloop* mainloop_new(void) {
 	struct mainloop* ml = calloc(1, sizeof(*ml));
 	return ml;
 }
@@ -246,6 +253,9 @@ void mainloop_destroy(struct mainloop* ml) {
 
 	// free all sources
 	for(struct ml_custom* c = ml->custom_list; c;) {
+		if(c->impl->destroy) {
+			c->impl->destroy(c);
+		}
 		struct ml_custom* n = c->next;
 		free(c);
 		c = n;
@@ -312,12 +322,12 @@ void mainloop_prepare(struct mainloop* ml) {
 
 	// prepare custom sources
 	unsigned n_fds = ml->n_io;
+	int timeout;
 	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
 		if(c->dead) {
 			continue;
 		}
 
-		assert(c->impl->prepare);
 		c->impl->prepare(c);
 		unsigned count = 0;
 		struct pollfd* fds = NULL;
@@ -326,9 +336,8 @@ void mainloop_prepare(struct mainloop* ml) {
 			count = ml->n_fds - n_fds;
 		}
 
-		assert(c->impl->get_fds);
-		c->impl->get_fds(c, &count, fds);
-		c->n_fds_last = n_fds;
+		count = c->impl->query(c, fds, count, &timeout);
+		c->n_fds_last = count;
 		n_fds += count;
 	}
 
@@ -355,13 +364,17 @@ void mainloop_prepare(struct mainloop* ml) {
 			}
 
 			unsigned count = c->n_fds_last;
-			assert(c->impl->get_fds);
-			c->impl->get_fds(c, &count, &ml->fds[i]);
+			count = c->impl->query(c, &ml->fds[i], count, &timeout);
 			assert(count == c->n_fds_last &&
 				"Custom event source changed number of fds without prepare");
+			if(timeout < ml->prepared_timeout) {
+				ml->prepared_timeout = timeout;
+			}
 			i += count;
 		}
 	}
+
+	return;
 }
 
 int mainloop_poll(struct mainloop* ml) {
@@ -370,7 +383,7 @@ int mainloop_poll(struct mainloop* ml) {
 	}
 
 	do {
-		ml->poll_ret = poll(ml->fds, ml->n_io, ml->prepared_timeout);
+		ml->poll_ret = poll(ml->fds, ml->n_fds, ml->prepared_timeout);
 	} while(ml->poll_ret < 0 && errno == EINTR);
 
 	if(ml->poll_ret < 0) {
@@ -380,7 +393,7 @@ int mainloop_poll(struct mainloop* ml) {
 	return ml->poll_ret;
 }
 
-void mainloop_dispatch(struct mainloop* ml) {
+void mainloop_dispatch(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) {
 	if(ml->n_enabled_defered) {
 		for(struct ml_defer* d = ml->defer_list; d; d = d->next) {
 			if(d->enabled && !d->dead) {
@@ -419,7 +432,7 @@ void mainloop_dispatch(struct mainloop* ml) {
 		return;
 	}
 
-	struct pollfd* fd = ml->fds;
+	struct pollfd* fd = fds;
 
 	// io events
 	for(struct ml_io* io = ml->io_list; io; io = io->next) {
@@ -432,6 +445,7 @@ void mainloop_dispatch(struct mainloop* ml) {
 			io->cb(io, map_flags_from_libc(fd->revents));
 		}
 		++fd;
+		assert(fd - fds <= n_fds);
 	}
 
 	// custom events
@@ -440,9 +454,9 @@ void mainloop_dispatch(struct mainloop* ml) {
 			continue;
 		}
 
-		assert(c->impl->dispatch);
-		c->impl->dispatch(c, c->n_fds_last, fd);
+		c->impl->dispatch(c, fd, c->n_fds_last);
 		fd += c->n_fds_last;
+		assert(fd - fds <= n_fds);
 	}
 }
 
@@ -453,13 +467,25 @@ int mainloop_iterate(struct mainloop* ml) {
 		return ret;
 	}
 
-	mainloop_dispatch(ml);
+	mainloop_dispatch(ml, ml->fds, ml->n_fds);
 	return 0;
+}
+
+unsigned mainloop_query(struct mainloop* ml, struct pollfd* fds, unsigned n_fds,
+		int* timeout) {
+	unsigned size = min(n_fds, ml->n_fds) * sizeof(*fds);
+	memcpy(fds, ml->fds, size);
+	*timeout = ml->prepared_timeout;
+	return ml->n_fds;
 }
 
 // ml_io
 struct ml_io* ml_io_new(struct mainloop* mainloop, int fd,
 		enum ml_io_flags events, ml_io_cb cb) {
+	assert(mainloop);
+	assert(fd >= 0);
+	assert(cb);
+
 	struct ml_io* io = calloc(1, sizeof(*io));
 	io->mainloop = mainloop;
 	io->fd = fd;
@@ -520,11 +546,16 @@ struct mainloop* ml_io_get_mainloop(struct ml_io* io) {
 // ml_timer
 struct ml_timer* ml_timer_new(struct mainloop* ml, const struct timespec* time,
 		ml_timer_cb cb) {
+	assert(ml);
+	assert(cb);
+
 	struct ml_timer* timer = calloc(1, sizeof(*timer));
 	timer->mainloop = ml;
 	timer->cb = cb;
-	timer->time = *time;
-	timer->enabled = true;
+	timer->enabled = time;
+	if(time) {
+		timer->time = *time;
+	}
 
 	if(ml->timer_list) {
 		ml->timer_list->prev = timer;
@@ -569,6 +600,9 @@ struct mainloop* ml_timer_get_mainloop(struct ml_timer* timer) {
 
 // ml_defer
 struct ml_defer* ml_defer_new(struct mainloop* ml, ml_defer_cb cb) {
+	assert(ml);
+	assert(cb);
+
 	struct ml_defer* defer = calloc(1, sizeof(*defer));
 	defer->cb = cb;
 	defer->mainloop = ml;
@@ -626,6 +660,12 @@ struct mainloop* ml_defer_get_mainloop(struct ml_defer* defer) {
 
 // ml_custom
 struct ml_custom* ml_custom_new(struct mainloop* ml, const struct ml_custom_impl* impl) {
+	assert(ml);
+	assert(impl);
+	assert(impl->dispatch);
+	assert(impl->prepare);
+	assert(impl->query);
+
 	struct ml_custom* custom = calloc(1, sizeof(*custom));
 	custom->mainloop = ml;
 	custom->impl = impl;
