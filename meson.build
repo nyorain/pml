@@ -23,7 +23,7 @@ add_project_arguments(
 )
 
 
-lib_ml = library('ml', ['mainloop.c'])
+lib_ml = library('posix_mainloop', ['mainloop.c'])
 
 # example/testing executable
 dep_pulse = dependency('libpulse')
