@@ -9,12 +9,17 @@
 #include <stdint.h>
 #include <time.h>
 #include <assert.h>
-#include <sys/poll.h>
+#include <poll.h>
 
 // TODO: implement the various caches and optimizations that
 // keep track of timeouts etc
 // TODO: keep track of state (prepared/polled/init) in mainloop
 // to assert those functions are used correctly?
+
+// additional features to look into
+// - supports other clocks that CLOCK_REALTIME
+// - support mainloop waking. Could be implemented manually by user as well
+//   though (if needed)
 
 struct ml_io {
 	struct ml_io* prev;
@@ -328,7 +333,10 @@ void mainloop_prepare(struct mainloop* ml) {
 			continue;
 		}
 
-		c->impl->prepare(c);
+		if(c->impl->prepare) {
+			c->impl->prepare(c);
+		}
+
 		unsigned count = 0;
 		struct pollfd* fds = NULL;
 		if(!ml->rebuild_fds && n_fds < ml->n_fds) {
@@ -367,7 +375,7 @@ void mainloop_prepare(struct mainloop* ml) {
 			count = c->impl->query(c, &ml->fds[i], count, &timeout);
 			assert(count == c->n_fds_last &&
 				"Custom event source changed number of fds without prepare");
-			if(timeout < ml->prepared_timeout) {
+			if(timeout >= 0 && timeout < ml->prepared_timeout) {
 				ml->prepared_timeout = timeout;
 			}
 			i += count;
@@ -663,7 +671,6 @@ struct ml_custom* ml_custom_new(struct mainloop* ml, const struct ml_custom_impl
 	assert(ml);
 	assert(impl);
 	assert(impl->dispatch);
-	assert(impl->prepare);
 	assert(impl->query);
 
 	struct ml_custom* custom = calloc(1, sizeof(*custom));
