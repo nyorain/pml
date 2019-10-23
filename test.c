@@ -348,7 +348,10 @@ int main() {
 	struct ml_custom* glib_custom = ml_custom_new(ml, &glib_custom_impl);
 	ml_custom_set_data(glib_custom, gctx);
 
-	// pulseaudio: we use the ml mainloop api to
+	// pulseaudio: we use the ml mainloop api to implement the pulseaudio
+	// mainloop interface. The use i developed this for: using this
+	// in a project that doesn't want to give pulseaudio its own thread
+	// but listen for events.
 	struct pa_mainloop_api pa_api = pulse_mainloop_api;
 	pa_api.userdata = ml;
 	pa_context* pactx = pa_context_new(&pa_api, NULL);
