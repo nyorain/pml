@@ -127,7 +127,7 @@ void ml_io_set_data(struct ml_io*, void*);
 void* ml_io_get_data(struct ml_io*);
 int ml_io_get_fd(struct ml_io*);
 void ml_io_destroy(struct ml_io*);
-void ml_io_set_destroy_db(struct ml_io*, ml_io_destroy_cb);
+void ml_io_set_destroy_cb(struct ml_io*, ml_io_destroy_cb);
 void ml_io_events(struct ml_io*, enum ml_io_flags);
 struct mainloop* ml_io_get_mainloop(struct ml_io*);
 
@@ -142,7 +142,7 @@ void ml_timer_restart(struct ml_timer*, const struct timespec*);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
 void ml_timer_destroy(struct ml_timer*);
-void ml_timer_set_destroy_db(struct ml_timer*, ml_timer_destroy_cb);
+void ml_timer_set_destroy_cb(struct ml_timer*, ml_timer_destroy_cb);
 struct mainloop* ml_timer_get_mainloop(struct ml_timer*);
 
 // ml_defer
@@ -154,7 +154,7 @@ void ml_defer_enable(struct ml_defer*, bool enable);
 void ml_defer_set_data(struct ml_defer*, void*);
 void* ml_defer_get_data(struct ml_defer*);
 void ml_defer_destroy(struct ml_defer*);
-void ml_defer_set_destroy_db(struct ml_defer*, ml_defer_destroy_cb);
+void ml_defer_set_destroy_cb(struct ml_defer*, ml_defer_destroy_cb);
 struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
 
 // ml_custom

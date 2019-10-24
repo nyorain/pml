@@ -83,7 +83,7 @@ static pa_io_event* paml_io_new(pa_mainloop_api* api, int fd,
 	iod->cb = cb;
 	iod->api = api;
 	ml_io_set_data(io, iod);
-	ml_io_set_destroy_db(io, &paml_io_destroy);
+	ml_io_set_destroy_cb(io, &paml_io_destroy);
 	return (pa_io_event*) io;
 }
 
@@ -136,7 +136,7 @@ static pa_time_event* paml_time_new(pa_mainloop_api* api,
 	td->cb = cb;
 	td->api = api;
 	ml_timer_set_data(t, td);
-	ml_timer_set_destroy_db(t, &paml_time_destroy);
+	ml_timer_set_destroy_cb(t, &paml_time_destroy);
 	return (pa_time_event*) t;
 }
 
@@ -190,7 +190,7 @@ static pa_defer_event* paml_defer_new(pa_mainloop_api* api,
 	dd->cb = cb;
 	dd->api = api;
 	ml_defer_set_data(d, dd);
-	ml_defer_set_destroy_db(d, &paml_defer_destroy);
+	ml_defer_set_destroy_cb(d, &paml_defer_destroy);
 	return (pa_defer_event*) d;
 }
 

@@ -118,8 +118,8 @@ static short map_flags_to_libc(enum ml_io_flags flags) {
     return (short)
         ((flags & ml_io_input ? POLLIN : 0) |
          (flags & ml_io_output ? POLLOUT : 0) |
-         (flags & ml_io_hangup ? POLLERR : 0) |
-         (flags & ml_io_error ? POLLHUP : 0));
+         (flags & ml_io_hangup ? POLLHUP : 0) |
+         (flags & ml_io_error ? POLLERR : 0));
 }
 
 static enum ml_io_flags map_flags_from_libc(short flags) {
@@ -362,6 +362,11 @@ void mainloop_prepare(struct mainloop* ml) {
 		}
 
 		count = c->impl->query(c, fds, count, &timeout);
+		assert(timeout >= -1);
+		if(ml->prepared_timeout == -1 || timeout < ml->prepared_timeout) {
+			ml->prepared_timeout = timeout;
+		}
+
 		c->n_fds_last = count;
 		n_fds += count;
 	}
@@ -388,14 +393,18 @@ void mainloop_prepare(struct mainloop* ml) {
 				continue;
 			}
 
-			unsigned count = c->n_fds_last;
-			count = c->impl->query(c, &ml->fds[i], count, &timeout);
+			unsigned count = c->impl->query(c, &ml->fds[i], c->n_fds_last, &timeout);
 			assert(count == c->n_fds_last &&
 				"Custom event source changed number of fds without prepare");
-			if(timeout >= 0 && timeout < ml->prepared_timeout) {
-				ml->prepared_timeout = timeout;
-			}
-			i += count;
+
+			// TODO: refresh timeout here?
+			// closer to poll i guess (compared to where we did
+			// it above); less timer delay...
+			// assert(timeout >= -1);
+			// if(ml->prepared_timeout == -1 || timeout < ml->prepared_timeout) {
+			// 	ml->prepared_timeout = timeout;
+			// }
+			// i += count;
 		}
 	}
 
@@ -452,11 +461,6 @@ void mainloop_dispatch(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) 
 	}
 
 	// dispatch pollfds
-	// only needed if poll returned a value >0 though
-	if(ml->poll_ret == 0) {
-		return;
-	}
-
 	struct pollfd* fd = fds;
 
 	// io events
@@ -556,7 +560,7 @@ void ml_io_destroy(struct ml_io* io) {
 	io->mainloop->rebuild_fds = true;
 }
 
-void ml_io_set_destroy_db(struct ml_io* io, ml_io_destroy_cb dcb) {
+void ml_io_set_destroy_cb(struct ml_io* io, ml_io_destroy_cb dcb) {
 	io->destroy_cb = dcb;
 }
 
@@ -619,7 +623,7 @@ void ml_timer_destroy(struct ml_timer* timer) {
 	++timer->mainloop->n_dead_timer;
 }
 
-void ml_timer_set_destroy_db(struct ml_timer* timer, ml_timer_destroy_cb dcb) {
+void ml_timer_set_destroy_cb(struct ml_timer* timer, ml_timer_destroy_cb dcb) {
 	timer->destroy_cb = dcb;
 }
 struct mainloop* ml_timer_get_mainloop(struct ml_timer* timer) {
@@ -679,7 +683,7 @@ void ml_defer_destroy(struct ml_defer* defer) {
 	defer->dead = true;
 	++defer->mainloop->n_dead_defer;
 }
-void ml_defer_set_destroy_db(struct ml_defer* defer, ml_defer_destroy_cb dcb) {
+void ml_defer_set_destroy_cb(struct ml_defer* defer, ml_defer_destroy_cb dcb) {
 	defer->destroy_cb = dcb;
 }
 struct mainloop* ml_defer_get_mainloop(struct ml_defer* defer) {
