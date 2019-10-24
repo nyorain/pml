@@ -24,10 +24,12 @@ add_project_arguments(
 
 
 lib_ml = library('posix_mainloop', ['mainloop.c'])
+posix_mainloop_dep = declare_dependency(
+	include_directories: [include_directories('.')],
+	link_with: lib_ml)
 
 # example/testing executable
 dep_pulse = dependency('libpulse')
 dep_playerctl = dependency('playerctl')
 executable('mltest', 'test.c',
-	link_with: lib_ml,
-	dependencies: [dep_pulse, dep_playerctl])
+	dependencies: [dep_pulse, dep_playerctl, posix_mainloop_dep])

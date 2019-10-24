@@ -479,6 +479,9 @@ void mainloop_dispatch(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) 
 			continue;
 		}
 
+		// TODO: should dispatch always be called?
+		// we could only call it if one of its fds has an revent or if
+		// its timeout has timed out
 		c->impl->dispatch(c, fd, c->n_fds_last);
 		fd += c->n_fds_last;
 		assert(fd - fds <= n_fds);
