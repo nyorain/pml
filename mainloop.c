@@ -37,6 +37,8 @@
 // - supports other clocks that CLOCK_REALTIME
 // - support mainloop waking. Could be implemented manually by user as well
 //   though (if needed)
+// - support less timer delay by preparing a timespec (epoch) instead
+//   of already calculating the resulting timeout interval
 
 struct ml_io {
 	struct ml_io* prev;
