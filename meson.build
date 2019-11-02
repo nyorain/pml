@@ -23,7 +23,9 @@ add_project_arguments(
 )
 
 
-lib_ml = library('posix_mainloop', ['mainloop.c'])
+lib_ml = library('posix_mainloop', ['mainloop.c'],
+	install: true)
+
 posix_mainloop_dep = declare_dependency(
 	include_directories: [include_directories('.')],
 	link_with: lib_ml)
