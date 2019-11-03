@@ -49,12 +49,13 @@ struct mainloop* mainloop_new(void);
 // The mainloop itself must not be used after this.
 void mainloop_destroy(struct mainloop*);
 
-// Performs one iteration on the mainloop. Will block until a file
-// descriptor becomes available or a timer times out.
+// Performs one iteration on the mainloop. If `block` is true, will block
+// until a file descriptor becomes available or a timer times out. Otherwise
+// might just return immediately, without any dispatched events.
 // If there are enabled deferred events, will just dispatch those.
 // See the 'prepare', 'query', 'poll', 'dispatch' functions below
 // if you need more fine-grained control.
-int mainloop_iterate(struct mainloop*);
+int mainloop_iterate(struct mainloop*, bool block);
 
 // Prepares the mainloop for polling, i.e. builds internal data structures
 // and the timeout to be used for polling.

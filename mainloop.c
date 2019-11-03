@@ -494,8 +494,12 @@ void mainloop_dispatch(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) 
 	}
 }
 
-int mainloop_iterate(struct mainloop* ml) {
+int mainloop_iterate(struct mainloop* ml, bool block) {
 	mainloop_prepare(ml);
+	if(!block) {
+		ml->prepared_timeout = 0;
+	}
+
 	int ret = mainloop_poll(ml);
 	if(ret < 0) {
 		return ret;
