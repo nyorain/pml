@@ -363,7 +363,7 @@ int main() {
     }
 
 	while(run) {
-		mainloop_iterate(ml);
+		mainloop_iterate(ml, true);
 	}
 
 	g_object_unref(manager);
