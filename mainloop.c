@@ -325,6 +325,35 @@ void mainloop_prepare(struct mainloop* ml) {
 		return;
 	}
 
+	// start with custom sources since they may change stuff
+	unsigned n_fds = ml->n_io;
+	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
+		if(c->dead) {
+			continue;
+		}
+
+		if(c->impl->prepare) {
+			c->impl->prepare(c);
+		}
+
+		unsigned count = 0;
+		struct pollfd* fds = NULL;
+		if(!ml->rebuild_fds && n_fds < ml->n_fds) {
+			fds = &ml->fds[n_fds];
+			count = ml->n_fds - n_fds;
+		}
+
+		int timeout;
+		count = c->impl->query(c, fds, count, &timeout);
+		assert(timeout >= -1);
+		if(ml->prepared_timeout == -1 || timeout < ml->prepared_timeout) {
+			ml->prepared_timeout = timeout;
+		}
+
+		c->n_fds_last = count;
+		n_fds += count;
+	}
+
 	// check timeout
 	ml->prepared_timeout = -1;
 	struct timespec now;
@@ -342,35 +371,6 @@ void mainloop_prepare(struct mainloop* ml) {
 		} else if(ml->prepared_timeout == -1 || ms < ml->prepared_timeout) {
 			ml->prepared_timeout = ms;
 		}
-	}
-
-	// prepare custom sources
-	unsigned n_fds = ml->n_io;
-	int timeout;
-	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
-		if(c->dead) {
-			continue;
-		}
-
-		if(c->impl->prepare) {
-			c->impl->prepare(c);
-		}
-
-		unsigned count = 0;
-		struct pollfd* fds = NULL;
-		if(!ml->rebuild_fds && n_fds < ml->n_fds) {
-			fds = &ml->fds[n_fds];
-			count = ml->n_fds - n_fds;
-		}
-
-		count = c->impl->query(c, fds, count, &timeout);
-		assert(timeout >= -1);
-		if(ml->prepared_timeout == -1 || timeout < ml->prepared_timeout) {
-			ml->prepared_timeout = timeout;
-		}
-
-		c->n_fds_last = count;
-		n_fds += count;
 	}
 
 	// rebuild fds if needed
@@ -395,6 +395,7 @@ void mainloop_prepare(struct mainloop* ml) {
 				continue;
 			}
 
+			int timeout;
 			unsigned count = c->impl->query(c, &ml->fds[i], c->n_fds_last, &timeout);
 			assert(count == c->n_fds_last &&
 				"Custom event source changed number of fds without prepare");
