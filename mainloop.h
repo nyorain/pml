@@ -121,14 +121,12 @@ enum ml_io_flags {
 
 // ml_io represents an event source for a single fd.
 typedef void (*ml_io_cb)(struct ml_io* e, enum ml_io_flags revents);
-typedef void (*ml_io_destroy_cb)(struct ml_io *e);
 
 struct ml_io* ml_io_new(struct mainloop*, int fd, enum ml_io_flags events, ml_io_cb);
 void ml_io_set_data(struct ml_io*, void*);
 void* ml_io_get_data(struct ml_io*);
 int ml_io_get_fd(struct ml_io*);
 void ml_io_destroy(struct ml_io*);
-void ml_io_set_destroy_cb(struct ml_io*, ml_io_destroy_cb);
 void ml_io_events(struct ml_io*, enum ml_io_flags);
 struct mainloop* ml_io_get_mainloop(struct ml_io*);
 
@@ -136,26 +134,22 @@ struct mainloop* ml_io_get_mainloop(struct ml_io*);
 // The passed timerspec values represent the timepoints using CLOCK_REALTIME
 // at which the timer should be triggered. They don't represent intervals.
 typedef void (*ml_timer_cb)(struct ml_timer* e, const struct timespec*);
-typedef void (*ml_timer_destroy_cb)(struct ml_timer *e);
 
 struct ml_timer* ml_timer_new(struct mainloop*, const struct timespec*, ml_timer_cb);
 void ml_timer_restart(struct ml_timer*, const struct timespec*);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
 void ml_timer_destroy(struct ml_timer*);
-void ml_timer_set_destroy_cb(struct ml_timer*, ml_timer_destroy_cb);
 struct mainloop* ml_timer_get_mainloop(struct ml_timer*);
 
 // ml_defer
 typedef void (*ml_defer_cb)(struct ml_defer* e);
-typedef void (*ml_defer_destroy_cb)(struct ml_defer *e);
 
 struct ml_defer* ml_defer_new(struct mainloop*, ml_defer_cb);
 void ml_defer_enable(struct ml_defer*, bool enable);
 void ml_defer_set_data(struct ml_defer*, void*);
 void* ml_defer_get_data(struct ml_defer*);
 void ml_defer_destroy(struct ml_defer*);
-void ml_defer_set_destroy_cb(struct ml_defer*, ml_defer_destroy_cb);
 struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
 
 // ml_custom
@@ -198,3 +192,74 @@ void ml_custom_set_data(struct ml_custom*, void*);
 void* ml_custom_get_data(struct ml_custom*);
 void ml_custom_destroy(struct ml_custom*);
 struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
+
+// Additional documentation
+// ========================
+//
+// Waking up a poll:
+// -----------------
+//
+// Waking the mainloop up from mainloop_iterate or mainloop_poll
+// from another thread is not possible. If an application needs this feature,
+// it can easily implement it as well as the mainloop could
+// do it internally by adding a ml_io with a one side of a pipe and
+// then simply write to the other end when wishing to wake up the
+// polling. On linux, this can be done even more efficiently using
+// eventfds.
+//
+// Multithreading:
+// ---------------
+//
+// Neither mainloop nor event sources have any internal synchronization
+// mechanisms. They also won't start any helper threads.
+// That means, applications can use externally synchronize access to
+// the mainloop and its sources, when needed.
+// Since the mainloop doesn't use any global state, it is also possible
+// to just multiple mainloops, e.g. one per thread.
+//
+// Re-entrance:
+// ------------
+//
+// The mainloop was designed to be re-entrant in certain scenarios.
+// In general, it is safe to start a new mainloop iteration during
+// the dispatch phase, i.e. from inside timer, io or defer callbacks
+// or in the ml_custom_impl.dispatch implementation.
+// In the other functions of ml_custom_impl, re-entrance is generally not
+// allowed. Changing other *non-custom* event sources from inside 'prepare'
+// is allowed though (even destroying them).
+//
+// Random weird re-entrant situations:
+// mainloop_iterate
+// | some callback (e.g. timer/deferred/io/custom dispatch) on source S
+// || mainloop_iterate
+// ||| another callback that destroys source S
+// || accesses source S passed as parameter. Destroyed now?
+// If an event source nests an iteration, it must be prepared that its
+// own source might have been destroyed. The mainloop will give no
+// guarantees of keeping sources alive while they are in a callback.
+// It will otherwise be prepared for this case though.
+//
+// mainloop_iterate
+// | io callback A with io_input
+// || mainloop_iterate
+// ||| io callback B with io_input
+// | io callback B with io_input. But no input there anymore since
+// | the callback above already read all data from the fd.
+// | So the callback signals revents & POLLIN but there isn't actually
+// | data.
+// There is no way to fix this in the mainloop though without manually checking
+// fds. This is instead shifted to the event sources. If the mainloop iterations
+// are nested, false positives may happen.
+// Note that this can happen even if A is a custom, timer or deferred event source.
+//
+// After an enable/disable or timer restart call returns its semantics have
+// effect. There won't be any delayed callbacks afterwards from a higher
+// mainloop iteration level.
+// But: for io events this isn't true. But this situation is similar
+// to the false positive above (it's just a delayed false positive callback
+// for an event the io isn't interested in anymore).
+//
+// In conclusion: you have to be careful when nesting mainloop iterations.
+// Avoid it if you can, but it some situations it might be useful.
+// Please report all bugs/unexpected behavior in the mainloop, testing
+// this or thinking of all the possible weird cases is hard.
