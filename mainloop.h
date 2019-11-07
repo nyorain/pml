@@ -182,9 +182,6 @@ struct ml_custom_impl {
 	// were returned from query, now filled with revents.
 	// Mandatory, i.e. must be implemented and not be NULL.
 	void (*dispatch)(struct ml_custom*, struct pollfd*, unsigned n_fds);
-	// Called when this event source is destroyed (via wl_custom_destroy
-	// or mainloop_destroy). Optional, can be NULL.
-	void (*destroy)(struct ml_custom*);
 };
 
 struct ml_custom* ml_custom_new(struct mainloop*, const struct ml_custom_impl*);
