@@ -337,6 +337,7 @@ void mainloop_prepare(struct mainloop* ml) {
 		struct timespec diff = t->time;
 		timespec_subtract(&diff, &now);
 		int64_t ms = timespec_ms(&diff);
+		// printf("ms: %d\n", (int)ms);
 		if(ms < 0) {
 			ml->prepared_timeout = 0;
 		} else if(ml->prepared_timeout == -1 || ms < ml->prepared_timeout) {
@@ -365,7 +366,9 @@ void mainloop_prepare(struct mainloop* ml) {
 
 		count = c->impl->query(c, fds, count, &timeout);
 		assert(timeout >= -1);
-		if(ml->prepared_timeout == -1 || timeout < ml->prepared_timeout) {
+
+		if(timeout != -1 && (ml->prepared_timeout == -1 ||
+				timeout < ml->prepared_timeout)) {
 			ml->prepared_timeout = timeout;
 		}
 
@@ -419,6 +422,7 @@ int mainloop_poll(struct mainloop* ml) {
 	}
 
 	do {
+		// printf("timeout: %d\n", (int) ml->prepared_timeout);
 		ml->poll_ret = poll(ml->fds, ml->n_fds, ml->prepared_timeout);
 	} while(ml->poll_ret < 0 && errno == EINTR);
 
