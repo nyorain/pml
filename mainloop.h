@@ -39,6 +39,10 @@ struct pollfd;
 
 // Opaque structure representing all information about the mainloop.
 struct mainloop;
+struct ml_io;
+struct ml_defer;
+struct ml_timer;
+struct ml_custom;
 
 // Creates a new, empty mainloop.
 // Must be freed using mainloop_destroy.
@@ -89,12 +93,12 @@ unsigned mainloop_query(struct mainloop*, struct pollfd* fds,
 // Polls the mainloop, using the prepared information.
 // Must only be called after mainloop_prepared was called.
 // But will ignore signals, i.e. continue polling in that case.
-// Returns the return value from poll.
+// Returns the return value from poll. Even if polling failed,
+// mainloop_dispatch must be called to consider the iteration finished.
 int mainloop_poll(struct mainloop*, int timeout);
 
 // Dispatches all ready callbacks.
-// Must be called after mainloop_poll, but only if that returned a
-// non-negative value (i.e. no error). Otherwise call `mainloop_cancel`.
+// Must be called after mainloop_poll, before starting a new iteration.
 // - fds: the pollfd values from mainloop_query, now filled with the
 //   revents from poll.
 // - n_fds: number of elements in the 'fds' array.
@@ -104,11 +108,14 @@ int mainloop_poll(struct mainloop*, int timeout);
 // the next iteration can be started using 'mainloop_prepare'.
 void mainloop_dispatch(struct mainloop*, struct pollfd* fds, unsigned n_fds);
 
-// Must be called when polling failed (returned a negative number) or
-// dispatching shouldn't happen for another case after `mainloop_prepare`
-// was already called.
-// Will cleanly finish the iteration but not dispatch any events.
-void mainloop_cancel(struct mainloop*);
+// Calls the provided iteration function with every event source of
+// the respective type created for the mainlopop.
+// The callback may destroy the given event source but must not
+// destroy other event sources of the respective type.
+void mainloop_for_each_io(struct mainloop*, void (*)(struct ml_io*));
+void mainloop_for_each_timer(struct mainloop*, void (*)(struct ml_timer*));
+void mainloop_for_each_defer(struct mainloop*, void (*)(struct ml_defer*));
+void mainloop_for_each_custom(struct mainloop*, void (*)(struct ml_custom*));
 
 struct ml_io;
 struct ml_timer;
@@ -133,6 +140,7 @@ void* ml_io_get_data(struct ml_io*);
 int ml_io_get_fd(struct ml_io*);
 void ml_io_destroy(struct ml_io*);
 void ml_io_events(struct ml_io*, enum ml_io_flags);
+ml_io_cb ml_io_get_cb(struct ml_io*);
 struct mainloop* ml_io_get_mainloop(struct ml_io*);
 
 // ml_timer
@@ -145,6 +153,7 @@ void ml_timer_restart(struct ml_timer*, const struct timespec*);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
 void ml_timer_destroy(struct ml_timer*);
+ml_timer_cb ml_timer_get_cb(struct ml_timer*);
 struct mainloop* ml_timer_get_mainloop(struct ml_timer*);
 
 // ml_defer
@@ -155,6 +164,7 @@ void ml_defer_enable(struct ml_defer*, bool enable);
 void ml_defer_set_data(struct ml_defer*, void*);
 void* ml_defer_get_data(struct ml_defer*);
 void ml_defer_destroy(struct ml_defer*);
+ml_defer_cb ml_defer_get_cb(struct ml_defer*);
 struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
 
 // ml_custom
@@ -191,19 +201,13 @@ struct ml_custom_impl {
 	// actually have data or that the timeout expired, this has to
 	// be checked first.
 	void (*dispatch)(struct ml_custom*, struct pollfd*, unsigned n_fds);
-	// Called after this source was prepared but dispatching should not
-	// happen. Optional, can be NULL.
-	// When polling fails or this source could be determined as not ready,
-	// this function will be called instead of dispatch. This is mainly
-	// interesting for custom implementations that somehow have to
-	// finish an iteration *in any case*.
-	void (*cancel)(struct ml_custom*);
 };
 
 struct ml_custom* ml_custom_new(struct mainloop*, const struct ml_custom_impl*);
 void ml_custom_set_data(struct ml_custom*, void*);
 void* ml_custom_get_data(struct ml_custom*);
 void ml_custom_destroy(struct ml_custom*);
+const struct ml_custom_impl* ml_custom_get_impl(struct ml_custom*);
 struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 
 // Additional documentation
@@ -275,13 +279,11 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // ---------------------
 //
 // The mainloop gives certain guarantees for custom event sources:
-// - query, dispatch or cancel will never be called without prepare being
-//   called first
+// - query or dispatch will never be called without prepare being called first
 // - after prepare being called, there will be exactly one call of
-//   dispatch or exactly one call of cancel before prepare might be
-//   called again
-// - calls to query will only happen between a call to prepare and
-//   the following call to dispatch or cancel.
+//   dispatch before prepare might be called again. This call will not
+//   happen if the source is destroyed in between though.
+// - calls to query will only happen between a call to prepare and dispatch
 // The conditions holds true even when the mainloop is using in re-entrant
 // scenarios. Dispatch counts as called as soon as the callback starts.
 // That means, if the custom implementation starts a mainloop iteration
@@ -289,5 +291,5 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // In turn, custom implementations are required to always return the
 // same values from 'query' if 'prepared' wasn't called. They furthermore
 // must not access the mainloop (i.e. start an iteration or use
-// the detailed iteration iteration api) in any way during 'prepare',
-// 'query' or 'cancel'.
+// the detailed iteration iteration api) in any way during 'prepare' or
+// 'query'

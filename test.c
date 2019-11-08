@@ -43,8 +43,17 @@ static void fd_cb(struct ml_io* io, enum ml_io_flags revents) {
 		return;
 	}
 
-	buf[ret] = '\0';
-	printf("Got: %s", buf);
+	if(ret > 0) { // replace newline at the end
+		buf[ret - 1] = '\0';
+	} else {
+		buf[ret] = '\0';
+	}
+
+	printf("Got: '%s'\n", buf);
+	if(strcmp(buf, "quit") == 0) {
+		printf("quitting.\n");
+		run = false;
+	}
 }
 
 // paml_io
@@ -264,7 +273,7 @@ static void pactx_state_cb(pa_context* pactx, void* data) {
 	// nest event loops (re-entrant) just for fun
 	struct mainloop* ml = data;
 	printf("waiting for pulse event\n");
-	while(!pulse_event) {
+	while(run && !pulse_event) {
 		mainloop_iterate(ml, true);
 	}
 	printf("done\n");
@@ -312,6 +321,24 @@ static const struct ml_custom_impl glib_custom_impl = {
 	.query = glib_query,
 	.dispatch = glib_dispatch
 };
+
+void io_destroy_paml_cb(struct ml_io* io) {
+	if(ml_io_get_cb(io) == paml_io_cb) {
+		paml_io_free((pa_io_event*) io);
+	}
+}
+
+void timer_destroy_paml_cb(struct ml_timer* t) {
+	if(ml_timer_get_cb(t) == paml_time_cb) {
+		paml_time_free((pa_time_event*) t);
+	}
+}
+
+void defer_destroy_paml_cb(struct ml_defer* d) {
+	if(ml_defer_get_cb(d) == paml_defer_cb) {
+		paml_defer_free((pa_defer_event*) d);
+	}
+}
 
 int main() {
 	struct mainloop* ml = mainloop_new();
@@ -377,9 +404,16 @@ int main() {
 		mainloop_iterate(ml, true);
 	}
 
+	g_main_context_release(gctx);
 	g_object_unref(manager);
 
-	// TODO: destroy (call destruction callback) of all pulse audio
-	// event sources before this
+	pa_context_disconnect(pactx);
+	pa_context_unref(pactx);
+
+	// We have to destroy the pulse audio (paml) event sources manually
+	// to make sure their data is freed and destruction callbacks triggered
+	mainloop_for_each_io(ml, io_destroy_paml_cb);
+	mainloop_for_each_timer(ml, timer_destroy_paml_cb);
+	mainloop_for_each_defer(ml, defer_destroy_paml_cb);
 	mainloop_destroy(ml);
 }

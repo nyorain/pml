@@ -28,13 +28,16 @@
 #include <assert.h>
 #include <poll.h>
 
-// TODO: allow re-entrance during custom.cancel
+// TODO: make callbacks mutable? shouldn't be a problem right?
 // TODO: rebuilding optimizations. On event source destruction
 // we could just set the fds to -1 (and potentially even re-use
 // them later on for different fds), instead of rebuilding.
 // Or: allow to change the fd on a ml_io?
 // TODO: implement the various caches and optimizations that
 // keep track of timeouts etc
+// - keep track of next timer while timers are created/changed so
+//   we don't have to iterate them in prepare
+// - keep a list of enabled defer events?
 // TODO: support less timer delay by preparing a minimal timespec (epoch) instead
 // of already calculating the resulting timeout interval.
 // And then calculate the timeout directly before polling
@@ -44,10 +47,14 @@
 // We could instead return if a new source was added/a timer reset
 // since then or something, that should be equivalent as we already
 // dispatch all.
-// TODO: give an document guarantees about custom->prepare always
-// called before custom->dispatch. Make sure that's true even if
-// poll fails? or don't give this guarantee? but that makes things
-// harder...
+// TODO(optimization): implement (and use in mainloop_iterate):
+// ```
+// // Like `mainloop_dispatch` but additionally takes the return code from ret.
+// // This is only used for internal optimizations such as not even checking
+// // the returned fds if poll returned an error or 0.
+// void mainloop_dispatch_with_poll_code(struct mainloop*,
+// 	struct pollfd* fds, unsigned n_fds, int poll_code);
+// ```
 
 // additional features to look into
 // - supports other clocks than CLOCK_REALTIME
@@ -57,7 +64,6 @@ enum state {
 	state_preparing,
 	state_prepared,
 	state_polled,
-	state_polled_error,
 	state_dispatch_timer,
 	state_dispatch_io,
 	state_dispatch_defer,
@@ -193,6 +199,7 @@ static void destroy_timer(struct ml_timer* t) {
 	if(t->prev) t->prev->next = t->next;
 	if(t == t->mainloop->timer.first) t->mainloop->timer.first = t->next;
 	if(t == t->mainloop->timer.last) t->mainloop->timer.last = t->prev;
+	free(t);
 }
 
 static void destroy_defer(struct ml_defer* d) {
@@ -208,6 +215,7 @@ static void destroy_custom(struct ml_custom* c) {
 	if(c->prev) c->prev->next = c->next;
 	if(c == c->mainloop->custom.first) c->mainloop->custom.first = c->next;
 	if(c == c->mainloop->custom.last) c->mainloop->custom.last = c->prev;
+	free(c);
 }
 
 // mainloop
@@ -222,6 +230,9 @@ void mainloop_destroy(struct mainloop* ml) {
 	}
 
 	assert(ml->dispatch_depth == 0);
+	if(ml->fds) {
+		free(ml->fds);
+	}
 
 	// free all sources
 	for(struct ml_custom* c = ml->custom.first; c;) {
@@ -261,14 +272,6 @@ void mainloop_prepare(struct mainloop* ml) {
 
 	ml->state = state_preparing;
 
-	// TODO: caches
-	// if there are enabled defer sources, we will simply dispatch
-	// those and not care about the rest
-	// if(ml->n_enabled_defered) {
-	// 	ml->state = state_prepared;
-	// 	return;
-	// }
-
 	// start with custom sources since they may change stuff
 	ml->prepared_timeout = -1;
 	unsigned n_fds = ml->n_io;
@@ -298,7 +301,6 @@ void mainloop_prepare(struct mainloop* ml) {
 	}
 
 	// check timeout
-	ml->prepared_timeout = -1;
 	if(ml->n_enabled_defered) {
 		ml->prepared_timeout = 0;
 	}
@@ -368,8 +370,6 @@ int mainloop_poll(struct mainloop* ml, int timeout) {
 
 	if(ml->poll_ret < 0) {
 		fprintf(stderr, "mainloop poll: %s (%d)\n", strerror(errno), errno);
-		ml->state = state_polled_error;
-		return ml->poll_ret;
 	}
 
 	ml->state = state_polled;
@@ -520,11 +520,6 @@ int mainloop_iterate(struct mainloop* ml, bool block) {
 	}
 
 	int ret = mainloop_poll(ml, ml->prepared_timeout);
-	if(ret < 0) {
-		mainloop_cancel(ml);
-		return ret;
-	}
-
 	mainloop_dispatch(ml, ml->fds, ml->n_fds);
 	return ret;
 }
@@ -547,17 +542,40 @@ unsigned mainloop_query(struct mainloop* ml, struct pollfd* fds, unsigned n_fds,
 	return ml->n_fds;
 }
 
-void mainloop_cancel(struct mainloop* ml) {
-	assert(ml->state == state_polled_error);
-
-	for(struct ml_custom* c = ml->custom.first; c; c = c->next) {
-		if(c->fds_id != UINT_MAX && c->impl->cancel) {
-			c->impl->cancel(c);
-		}
+void mainloop_for_each_io(struct mainloop* ml, void (*cb)(struct ml_io*)) {
+	struct ml_io* io;
+	struct ml_io* next = ml->io.first;
+	while((io = next)) {
+		next = io->next;
+		cb(io);
 	}
+}
 
-	ml->state = state_none;
-	ml->state_data = NULL;
+void mainloop_for_each_timer(struct mainloop* ml, void (*cb)(struct ml_timer*)) {
+	struct ml_timer* x;
+	struct ml_timer* next = ml->timer.first;
+	while((x = next)) {
+		next = x->next;
+		cb(x);
+	}
+}
+
+void mainloop_for_each_defer(struct mainloop* ml, void (*cb)(struct ml_defer*)) {
+	struct ml_defer* x;
+	struct ml_defer* next = ml->defer.first;
+	while((x = next)) {
+		next = x->next;
+		cb(x);
+	}
+}
+
+void mainloop_for_each_custom(struct mainloop* ml, void (*cb)(struct ml_custom*)) {
+	struct ml_custom* x;
+	struct ml_custom* next = ml->custom.first;
+	while((x = next)) {
+		next = x->next;
+		cb(x);
+	}
 }
 
 // ml_io
@@ -629,6 +647,10 @@ struct mainloop* ml_io_get_mainloop(struct ml_io* io) {
 	return io->mainloop;
 }
 
+ml_io_cb ml_io_get_cb(struct ml_io* io) {
+	return io->cb;
+}
+
 // ml_timer
 struct ml_timer* ml_timer_new(struct mainloop* ml, const struct timespec* time,
 		ml_timer_cb cb) {
@@ -685,6 +707,10 @@ void ml_timer_destroy(struct ml_timer* timer) {
 
 struct mainloop* ml_timer_get_mainloop(struct ml_timer* timer) {
 	return timer->mainloop;
+}
+
+ml_timer_cb ml_timer_get_cb(struct ml_timer* timer) {
+	return timer->cb;
 }
 
 // ml_defer
@@ -747,8 +773,13 @@ void ml_defer_destroy(struct ml_defer* defer) {
 
 	destroy_defer(defer);
 }
+
 struct mainloop* ml_defer_get_mainloop(struct ml_defer* defer) {
 	return defer->mainloop;
+}
+
+ml_defer_cb ml_defer_get_cb(struct ml_defer* defer) {
+	return defer->cb;
 }
 
 // ml_custom
@@ -797,4 +828,8 @@ void ml_custom_destroy(struct ml_custom* custom) {
 
 struct mainloop* ml_custom_get_mainloop(struct ml_custom* custom) {
 	return custom->mainloop;
+}
+
+const struct ml_custom_impl* ml_custom_get_impl(struct ml_custom* custom) {
+	return custom->impl;
 }
