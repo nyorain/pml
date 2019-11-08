@@ -55,6 +55,7 @@ void mainloop_destroy(struct mainloop*);
 // If there are enabled deferred events, will just dispatch those.
 // See the 'prepare', 'query', 'poll', 'dispatch' functions below
 // if you need more fine-grained control.
+// Returns a negative value on error and 0 on success.
 int mainloop_iterate(struct mainloop*, bool block);
 
 // Prepares the mainloop for polling, i.e. builds internal data structures
@@ -86,16 +87,14 @@ unsigned mainloop_query(struct mainloop*, struct pollfd* fds,
 	unsigned n_fds, int* timeout);
 
 // Polls the mainloop, using the prepared information.
-// Must be called after mainloop_prepared.
-// Will return the number of available file descriptors, 0 if polling
-// timed out or a negative number if an error ocurred (errno will be set
-// from poll), basically the return value from poll.
+// Must only be called after mainloop_prepared was called.
 // But will ignore signals, i.e. continue polling in that case.
-int mainloop_poll(struct mainloop*);
+// Returns the return value from poll.
+int mainloop_poll(struct mainloop*, int timeout);
 
 // Dispatches all ready callbacks.
-// Must be called after mainloop_poll (or mainloop_query in case the
-// timeout was 0). In this case NULL and 0 can be provided for fds and n_fds.
+// Must be called after mainloop_poll, but only if that returned a
+// non-negative value (i.e. no error). Otherwise call `mainloop_cancel`.
 // - fds: the pollfd values from mainloop_query, now filled with the
 //   revents from poll.
 // - n_fds: number of elements in the 'fds' array.
@@ -104,6 +103,12 @@ int mainloop_poll(struct mainloop*);
 // After this call, one iteration of the mainloop is complete and
 // the next iteration can be started using 'mainloop_prepare'.
 void mainloop_dispatch(struct mainloop*, struct pollfd* fds, unsigned n_fds);
+
+// Must be called when polling failed (returned a negative number) or
+// dispatching shouldn't happen for another case after `mainloop_prepare`
+// was already called.
+// Will cleanly finish the iteration but not dispatch any events.
+void mainloop_cancel(struct mainloop*);
 
 struct ml_io;
 struct ml_timer;
@@ -176,12 +181,23 @@ struct ml_custom_impl {
 	//   already ready (i.e. there shouldn't be any polling at all and
 	//   dispatch should be called as soon as possible).
 	// Returns the number of pollfds available.
-	unsigned (*query)(struct ml_custom*, struct pollfd*, unsigned n_fds, int* timeout);
+	unsigned (*query)(struct ml_custom*, struct pollfd*, unsigned n_fds,
+		int* timeout);
 	// Should dispatch all internal event sources using the filled
 	// pollfds (with length n_fds). Guaranteed to be the same that
 	// were returned from query, now filled with revents.
 	// Mandatory, i.e. must be implemented and not be NULL.
+	// Note that dispatch being called doesn't mean that the pollfds
+	// actually have data or that the timeout expired, this has to
+	// be checked first.
 	void (*dispatch)(struct ml_custom*, struct pollfd*, unsigned n_fds);
+	// Called after this source was prepared but dispatching should not
+	// happen. Optional, can be NULL.
+	// When polling fails or this source could be determined as not ready,
+	// this function will be called instead of dispatch. This is mainly
+	// interesting for custom implementations that somehow have to
+	// finish an iteration *in any case*.
+	void (*cancel)(struct ml_custom*);
 };
 
 struct ml_custom* ml_custom_new(struct mainloop*, const struct ml_custom_impl*);
@@ -230,33 +246,48 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // | some callback (e.g. timer/deferred/io/custom dispatch) on source S
 // || mainloop_iterate
 // ||| another callback that destroys source S
-// || accesses source S passed as parameter. Destroyed now?
+// || access source S. It is destroyed now though. Undefined behavior.
 // If an event source nests an iteration, it must be prepared that its
 // own source might have been destroyed. The mainloop will give no
-// guarantees of keeping sources alive while they are in a callback.
+// guarantees of keeping sources alive while they are in a callback
+// if the source associated with the callback is destroyed during it.
 // It will otherwise be prepared for this case though.
-//
-// mainloop_iterate
-// | io callback A with io_input
-// || mainloop_iterate
-// ||| io callback B with io_input
-// | io callback B with io_input. But no input there anymore since
-// | the callback above already read all data from the fd.
-// | So the callback signals revents & POLLIN but there isn't actually
-// | data.
-// There is no way to fix this in the mainloop though without manually checking
-// fds. This is instead shifted to the event sources. If the mainloop iterations
-// are nested, false positives may happen.
-// Note that this can happen even if A is a custom, timer or deferred event source.
+// The same counts for this even simpler scenario, here it becomes more
+// obvious that any logic keeping S alive would be unexpected.
+// | mainloop_iterate
+// || some callback on source S
+// ||| destroy(S)
+// ||| using S here is obviously undefined behavior.
+// Otherwise it is perfectly valid to destroy an event source from
+// within its own callback. It just must not be used in any way afterwards.
 //
 // After an enable/disable or timer restart call returns its semantics have
 // effect. There won't be any delayed callbacks afterwards from a higher
-// mainloop iteration level.
-// But: for io events this isn't true. But this situation is similar
-// to the false positive above (it's just a delayed false positive callback
-// for an event the io isn't interested in anymore).
+// mainloop iteration level. The same is true for fd events, there won't
+// be any delayed false positives for events that weren't requested.
 //
 // In conclusion: you have to be careful when nesting mainloop iterations.
 // Avoid it if you can, but it some situations it might be useful.
 // Please report all bugs/unexpected behavior in the mainloop, testing
 // this or thinking of all the possible weird cases is hard.
+//
+// Custom event sources:
+// ---------------------
+//
+// The mainloop gives certain guarantees for custom event sources:
+// - query, dispatch or cancel will never be called without prepare being
+//   called first
+// - after prepare being called, there will be exactly one call of
+//   dispatch or exactly one call of cancel before prepare might be
+//   called again
+// - calls to query will only happen between a call to prepare and
+//   the following call to dispatch or cancel.
+// The conditions holds true even when the mainloop is using in re-entrant
+// scenarios. Dispatch counts as called as soon as the callback starts.
+// That means, if the custom implementation starts a mainloop iteration
+// from within its dispatch callack, prepared might be called again.
+// In turn, custom implementations are required to always return the
+// same values from 'query' if 'prepared' wasn't called. They furthermore
+// must not access the mainloop (i.e. start an iteration or use
+// the detailed iteration iteration api) in any way during 'prepare',
+// 'query' or 'cancel'.

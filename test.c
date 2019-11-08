@@ -24,7 +24,7 @@ static void timer_cb(struct ml_timer* timer, const struct timespec* t) {
 
 	struct timespec next;
 	clock_gettime(CLOCK_REALTIME, &next);
-	next.tv_sec += 1;
+	next.tv_sec += 5;
 	ml_timer_restart(timer, &next);
 }
 
@@ -60,16 +60,8 @@ static void paml_io_cb(struct ml_io* io, enum ml_io_flags revents) {
 	assert(iod->cb);
 
 	int fd = ml_io_get_fd(io);
-	int pa_revents = (pa_io_event_flags_t) revents;
+	int pa_revents = (pa_io_event_flags_t) revents; // they are the same
 	iod->cb(iod->api, (pa_io_event*) io, fd, pa_revents, iod->data);
-}
-
-static void paml_io_destroy(struct ml_io* io) {
-	struct paml_io_data* iod = ml_io_get_data(io);
-	if(iod->destroy_cb) {
-		iod->destroy_cb(iod->api, (pa_io_event*) io, iod->data);
-	}
-	free(iod);
 }
 
 static pa_io_event* paml_io_new(pa_mainloop_api* api, int fd,
@@ -83,7 +75,6 @@ static pa_io_event* paml_io_new(pa_mainloop_api* api, int fd,
 	iod->cb = cb;
 	iod->api = api;
 	ml_io_set_data(io, iod);
-	ml_io_set_destroy_cb(io, &paml_io_destroy);
 	return (pa_io_event*) io;
 }
 
@@ -93,6 +84,15 @@ static void paml_io_enable(pa_io_event* e, pa_io_event_flags_t pa_events) {
 }
 
 static void paml_io_free(pa_io_event* e) {
+	if(!e) {
+		return;
+	}
+
+	struct paml_io_data* dd = ml_io_get_data((struct ml_io*) e);
+	if(dd->destroy_cb) {
+		dd->destroy_cb(dd->api, e, dd->data);
+	}
+	free(dd);
 	ml_io_destroy((struct ml_io*) e);
 }
 
@@ -114,15 +114,7 @@ static void paml_time_cb(struct ml_timer* t, const struct timespec* time) {
 	assert(td->cb);
 
 	struct timeval tv = {time->tv_sec, time->tv_nsec / 1000};
-	td->cb(td->api, (pa_time_event*) td, &tv, td->data);
-}
-
-static void paml_time_destroy(struct ml_timer* t) {
-	struct paml_time_data* td = ml_timer_get_data(t);
-	if(td->destroy_cb) {
-		td->destroy_cb(td->api, (pa_time_event*) td, td->data);
-	}
-	free(td);
+	td->cb(td->api, (pa_time_event*) t, &tv, td->data);
 }
 
 static pa_time_event* paml_time_new(pa_mainloop_api* api,
@@ -136,7 +128,6 @@ static pa_time_event* paml_time_new(pa_mainloop_api* api,
 	td->cb = cb;
 	td->api = api;
 	ml_timer_set_data(t, td);
-	ml_timer_set_destroy_cb(t, &paml_time_destroy);
 	return (pa_time_event*) t;
 }
 
@@ -150,6 +141,15 @@ static void paml_time_restart(pa_time_event* e, const struct timeval* tv) {
 }
 
 static void paml_time_free(pa_time_event* e) {
+	if(!e) {
+		return;
+	}
+
+	struct paml_time_data* dd = ml_timer_get_data((struct ml_timer*) e);
+	if(dd->destroy_cb) {
+		dd->destroy_cb(dd->api, e, dd->data);
+	}
+	free(dd);
 	ml_timer_destroy((struct ml_timer*) e);
 }
 
@@ -172,14 +172,6 @@ static void paml_defer_cb(struct ml_defer* d) {
 	dd->cb(dd->api, (pa_defer_event*) d, dd->data);
 }
 
-static void paml_defer_destroy(struct ml_defer* d) {
-	struct paml_defer_data* dd = ml_defer_get_data(d);
-	if(dd->destroy_cb) {
-		dd->destroy_cb(dd->api, (pa_defer_event*) d, dd->data);
-	}
-	free(dd);
-}
-
 static pa_defer_event* paml_defer_new(pa_mainloop_api* api,
 		pa_defer_event_cb_t cb, void* data) {
 	struct mainloop* ml = (struct mainloop*) api->userdata;
@@ -190,7 +182,6 @@ static pa_defer_event* paml_defer_new(pa_mainloop_api* api,
 	dd->cb = cb;
 	dd->api = api;
 	ml_defer_set_data(d, dd);
-	ml_defer_set_destroy_cb(d, &paml_defer_destroy);
 	return (pa_defer_event*) d;
 }
 
@@ -199,6 +190,15 @@ static void paml_defer_enable(pa_defer_event* e, int enable) {
 }
 
 static void paml_defer_free(pa_defer_event* e) {
+	if(!e) {
+		return;
+	}
+
+	struct paml_defer_data* dd = ml_defer_get_data((struct ml_defer*) e);
+	if(dd->destroy_cb) {
+		dd->destroy_cb(dd->api, e, dd->data);
+	}
+	free(dd);
 	ml_defer_destroy((struct ml_defer*) e);
 }
 
@@ -231,14 +231,17 @@ static const struct pa_mainloop_api pulse_mainloop_api = {
 	.quit = paml_quit,
 };
 
+bool pulse_event = false;
 static void pactx_subscribe_cb(pa_context* pactx,
 		pa_subscription_event_type_t t, uint32_t idx, void *userdata) {
 	printf("pulse event: type = %d, idx = %d\n", t, idx);
+	pulse_event = true;
 }
 
 static void pactx_state_cb(pa_context* pactx, void* data) {
 	int s = pa_context_get_state(pactx);
 	printf("pulse state: %d\n", s);
+
 	if(s != PA_CONTEXT_READY) {
 		return;
 	}
@@ -257,6 +260,14 @@ static void pactx_state_cb(pa_context* pactx, void* data) {
 		PA_SUBSCRIPTION_MASK_CARD, NULL, NULL);
 	assert(o);
 	pa_operation_unref(o);
+
+	// nest event loops (re-entrant) just for fun
+	struct mainloop* ml = data;
+	printf("waiting for pulse event\n");
+	while(!pulse_event) {
+		mainloop_iterate(ml, true);
+	}
+	printf("done\n");
 }
 
 static gboolean player_status_cb(PlayerctlPlayer* player,
@@ -308,7 +319,7 @@ int main() {
 	// ml_timer source: triggers once every second
 	struct timespec time;
 	clock_gettime(CLOCK_REALTIME, &time);
-	time.tv_sec += 1;
+	time.tv_sec += 10;
 	struct ml_timer* timer = ml_timer_new(ml, &time, &timer_cb);
 	(void) timer;
 
@@ -355,7 +366,7 @@ int main() {
 	struct pa_mainloop_api pa_api = pulse_mainloop_api;
 	pa_api.userdata = ml;
 	pa_context* pactx = pa_context_new(&pa_api, NULL);
-    pa_context_set_state_callback(pactx, pactx_state_cb, NULL);
+    pa_context_set_state_callback(pactx, pactx_state_cb, ml);
 
 	if(pa_context_connect(pactx, NULL, 0, NULL) < 0) {
         printf("pa_context_connect() failed: %s", strerror(pa_context_errno(pactx)));
@@ -367,5 +378,8 @@ int main() {
 	}
 
 	g_object_unref(manager);
+
+	// TODO: destroy (call destruction callback) of all pulse audio
+	// event sources before this
 	mainloop_destroy(ml);
 }
