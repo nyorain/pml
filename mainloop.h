@@ -102,8 +102,10 @@ int mainloop_poll(struct mainloop*, int timeout);
 // - fds: the pollfd values from mainloop_query, now filled with the
 //   revents from poll.
 // - n_fds: number of elements in the 'fds' array.
-// The data in fds and n_fds (except revents) should match what was
-// returned by mainloop_query.
+// The data in fds and n_fds (except revents) must match what was
+// returned by mainloop_query. Calling this with fewer or different
+// fds (the pointer doesn't have to be the same though) than returned
+// by query is an error.
 // After this call, one iteration of the mainloop is complete and
 // the next iteration can be started using 'mainloop_prepare'.
 void mainloop_dispatch(struct mainloop*, struct pollfd* fds, unsigned n_fds);

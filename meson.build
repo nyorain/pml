@@ -33,5 +33,8 @@ posix_mainloop_dep = declare_dependency(
 # example/testing executable
 dep_pulse = dependency('libpulse')
 dep_playerctl = dependency('playerctl')
-executable('mltest', 'test.c',
+executable('mlexample', 'example.c',
 	dependencies: [dep_pulse, dep_playerctl, posix_mainloop_dep])
+
+executable('mltest-nested', 'test-nested.c',
+	dependencies: [posix_mainloop_dep])
