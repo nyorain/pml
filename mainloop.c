@@ -325,29 +325,9 @@ void mainloop_prepare(struct mainloop* ml) {
 		return;
 	}
 
-	// check timeout
+	// start with custom sources since they may change stuff
 	ml->prepared_timeout = -1;
-	struct timespec now;
-	clock_gettime(CLOCK_REALTIME, &now);
-	for(struct ml_timer* t = ml->timer_list; t; t = t->next) {
-		if(t->dead || !t->enabled) {
-			continue;
-		}
-
-		struct timespec diff = t->time;
-		timespec_subtract(&diff, &now);
-		int64_t ms = timespec_ms(&diff);
-		// printf("ms: %d\n", (int)ms);
-		if(ms < 0) {
-			ml->prepared_timeout = 0;
-		} else if(ml->prepared_timeout == -1 || ms < ml->prepared_timeout) {
-			ml->prepared_timeout = ms;
-		}
-	}
-
-	// prepare custom sources
 	unsigned n_fds = ml->n_io;
-	int timeout;
 	for(struct ml_custom* c = ml->custom_list; c; c = c->next) {
 		if(c->dead) {
 			continue;
@@ -364,6 +344,7 @@ void mainloop_prepare(struct mainloop* ml) {
 			count = ml->n_fds - n_fds;
 		}
 
+		int timeout;
 		count = c->impl->query(c, fds, count, &timeout);
 		assert(timeout >= -1);
 
@@ -374,6 +355,24 @@ void mainloop_prepare(struct mainloop* ml) {
 
 		c->n_fds_last = count;
 		n_fds += count;
+	}
+
+	// check timeout
+	struct timespec now;
+	clock_gettime(CLOCK_REALTIME, &now);
+	for(struct ml_timer* t = ml->timer_list; t; t = t->next) {
+		if(t->dead || !t->enabled) {
+			continue;
+		}
+
+		struct timespec diff = t->time;
+		timespec_subtract(&diff, &now);
+		int64_t ms = timespec_ms(&diff);
+		if(ms < 0) {
+			ml->prepared_timeout = 0;
+		} else if(ml->prepared_timeout == -1 || ms < ml->prepared_timeout) {
+			ml->prepared_timeout = ms;
+		}
 	}
 
 	// rebuild fds if needed
@@ -398,18 +397,10 @@ void mainloop_prepare(struct mainloop* ml) {
 				continue;
 			}
 
+			int timeout;
 			unsigned count = c->impl->query(c, &ml->fds[i], c->n_fds_last, &timeout);
 			assert(count == c->n_fds_last &&
 				"Custom event source changed number of fds without prepare");
-
-			// TODO: refresh timeout here?
-			// closer to poll i guess (compared to where we did
-			// it above); less timer delay...
-			// assert(timeout >= -1);
-			// if(ml->prepared_timeout == -1 || timeout < ml->prepared_timeout) {
-			// 	ml->prepared_timeout = timeout;
-			// }
-			// i += count;
 		}
 	}
 
