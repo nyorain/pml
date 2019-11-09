@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 201710L
 #include <stdio.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -11,23 +12,24 @@
 #include <pulse/context.h>
 #include <pulse/subscribe.h>
 #include <playerctl/playerctl.h>
-#include "mainloop.h"
+#include "pml.h"
 
 bool run = true;
 unsigned count = 0;
 
-static void timer_cb(struct ml_timer* timer) {
+static void timer_cb(struct pml_timer* timer) {
 	printf("timer\n");
 	// if(++count == 10) {
 	// 	run = false;
 	// }
 
 	struct timespec next = { .tv_sec = 5 };
-	ml_timer_set_time_rel(timer, next);
+	pml_timer_set_time_rel(timer, next);
 }
 
-static void fd_cb(struct ml_io* io, unsigned revents) {
+static void fd_cb(struct pml_io* io, unsigned revents) {
 	assert(revents == POLLIN);
+
 	char buf[512];
 	int size = 511;
 	int ret;
@@ -62,11 +64,11 @@ struct paml_io_data {
 	struct pa_mainloop_api* api;
 };
 
-static void paml_io_cb(struct ml_io* io, unsigned revents) {
-	struct paml_io_data* iod = ml_io_get_data(io);
+static void paml_io_cb(struct pml_io* io, unsigned revents) {
+	struct paml_io_data* iod = pml_io_get_data(io);
 	assert(iod->cb);
 
-	int fd = ml_io_get_fd(io);
+	int fd = pml_io_get_fd(io);
 	pa_io_event_flags_t pa_revents =
 		(revents & POLLIN ? PA_IO_EVENT_INPUT : 0) |
 		(revents & POLLOUT ? PA_IO_EVENT_OUTPUT : 0) |
@@ -77,17 +79,17 @@ static void paml_io_cb(struct ml_io* io, unsigned revents) {
 
 static pa_io_event* paml_io_new(pa_mainloop_api* api, int fd,
 		pa_io_event_flags_t pa_events, pa_io_event_cb_t cb, void* data) {
-	struct mainloop* ml = (struct mainloop*) api->userdata;
+	struct pml* pml = (struct pml*) api->userdata;
 	unsigned events =
 		(pa_events & PA_IO_EVENT_INPUT ? POLLIN : 0) |
 		(pa_events & PA_IO_EVENT_OUTPUT ? POLLOUT : 0);
-	struct ml_io* io = ml_io_new(ml, fd, events, &paml_io_cb);
+	struct pml_io* io = pml_io_new(pml, fd, events, &paml_io_cb);
 
 	struct paml_io_data* iod = calloc(1, sizeof(*iod));
 	iod->data = data;
 	iod->cb = cb;
 	iod->api = api;
-	ml_io_set_data(io, iod);
+	pml_io_set_data(io, iod);
 	return (pa_io_event*) io;
 }
 
@@ -95,7 +97,7 @@ static void paml_io_enable(pa_io_event* e, pa_io_event_flags_t pa_events) {
 	unsigned events =
 		(pa_events & PA_IO_EVENT_INPUT ? POLLIN : 0) |
 		(pa_events & PA_IO_EVENT_OUTPUT ? POLLOUT : 0);
-	ml_io_set_events((struct ml_io*) e, events);
+	pml_io_set_events((struct pml_io*) e, events);
 }
 
 static void paml_io_free(pa_io_event* e) {
@@ -103,16 +105,16 @@ static void paml_io_free(pa_io_event* e) {
 		return;
 	}
 
-	struct paml_io_data* dd = ml_io_get_data((struct ml_io*) e);
+	struct paml_io_data* dd = pml_io_get_data((struct pml_io*) e);
 	if(dd->destroy_cb) {
 		dd->destroy_cb(dd->api, e, dd->data);
 	}
 	free(dd);
-	ml_io_destroy((struct ml_io*) e);
+	pml_io_destroy((struct pml_io*) e);
 }
 
 static void paml_io_set_destroy(pa_io_event* e, pa_io_event_destroy_cb_t cb) {
-	struct paml_io_data* iod = ml_io_get_data((struct ml_io*) e);
+	struct paml_io_data* iod = pml_io_get_data((struct pml_io*) e);
 	iod->destroy_cb = cb;
 }
 
@@ -124,35 +126,35 @@ struct paml_time_data {
 	struct pa_mainloop_api* api;
 };
 
-static void paml_time_cb(struct ml_timer* t) {
-	struct paml_time_data* td = ml_timer_get_data(t);
+static void paml_time_cb(struct pml_timer* t) {
+	struct paml_time_data* td = pml_timer_get_data(t);
 	assert(td->cb);
 
-	struct timespec time = ml_timer_get_time(t);
+	struct timespec time = pml_timer_get_time(t);
 	struct timeval tv = {time.tv_sec, time.tv_nsec / 1000};
 	td->cb(td->api, (pa_time_event*) t, &tv, td->data);
 }
 
 static pa_time_event* paml_time_new(pa_mainloop_api* api,
 		const struct timeval* tv, pa_time_event_cb_t cb, void* data) {
-	struct mainloop* ml = (struct mainloop*) api->userdata;
+	struct pml* pml = (struct pml*) api->userdata;
 	struct timespec ts = { tv->tv_sec, tv->tv_usec * 1000 };
-	struct ml_timer* t = ml_timer_new(ml, &ts, &paml_time_cb);
+	struct pml_timer* t = pml_timer_new(pml, &ts, &paml_time_cb);
 
 	struct paml_time_data* td = calloc(1, sizeof(*td));
 	td->data = data;
 	td->cb = cb;
 	td->api = api;
-	ml_timer_set_data(t, td);
+	pml_timer_set_data(t, td);
 	return (pa_time_event*) t;
 }
 
 static void paml_time_restart(pa_time_event* e, const struct timeval* tv) {
 	if(!tv) {
-		ml_timer_disable((struct ml_timer*) e);
+		pml_timer_disable((struct pml_timer*) e);
 	} else {
 		struct timespec ts = {tv->tv_sec, 1000 * tv->tv_usec};
-		ml_timer_set_time((struct ml_timer*) e, ts);
+		pml_timer_set_time((struct pml_timer*) e, ts);
 	}
 }
 
@@ -161,16 +163,16 @@ static void paml_time_free(pa_time_event* e) {
 		return;
 	}
 
-	struct paml_time_data* dd = ml_timer_get_data((struct ml_timer*) e);
+	struct paml_time_data* dd = pml_timer_get_data((struct pml_timer*) e);
 	if(dd->destroy_cb) {
 		dd->destroy_cb(dd->api, e, dd->data);
 	}
 	free(dd);
-	ml_timer_destroy((struct ml_timer*) e);
+	pml_timer_destroy((struct pml_timer*) e);
 }
 
 static void paml_time_set_destroy(pa_time_event* e, pa_time_event_destroy_cb_t cb) {
-	struct paml_time_data* td = ml_timer_get_data((struct ml_timer*) e);
+	struct paml_time_data* td = pml_timer_get_data((struct pml_timer*) e);
 	td->destroy_cb = cb;
 }
 
@@ -182,27 +184,27 @@ struct paml_defer_data {
 	struct pa_mainloop_api* api;
 };
 
-static void paml_defer_cb(struct ml_defer* d) {
-	struct paml_defer_data* dd = ml_defer_get_data(d);
+static void paml_defer_cb(struct pml_defer* d) {
+	struct paml_defer_data* dd = pml_defer_get_data(d);
 	assert(dd->cb);
 	dd->cb(dd->api, (pa_defer_event*) d, dd->data);
 }
 
 static pa_defer_event* paml_defer_new(pa_mainloop_api* api,
 		pa_defer_event_cb_t cb, void* data) {
-	struct mainloop* ml = (struct mainloop*) api->userdata;
-	struct ml_defer* d = ml_defer_new(ml, &paml_defer_cb);
+	struct pml* pml = (struct pml*) api->userdata;
+	struct pml_defer* d = pml_defer_new(pml, &paml_defer_cb);
 
 	struct paml_defer_data* dd = calloc(1, sizeof(*dd));
 	dd->data = data;
 	dd->cb = cb;
 	dd->api = api;
-	ml_defer_set_data(d, dd);
+	pml_defer_set_data(d, dd);
 	return (pa_defer_event*) d;
 }
 
 static void paml_defer_enable(pa_defer_event* e, int enable) {
-	ml_defer_enable((struct ml_defer*) e, (bool) enable);
+	pml_defer_enable((struct pml_defer*) e, (bool) enable);
 }
 
 static void paml_defer_free(pa_defer_event* e) {
@@ -210,16 +212,16 @@ static void paml_defer_free(pa_defer_event* e) {
 		return;
 	}
 
-	struct paml_defer_data* dd = ml_defer_get_data((struct ml_defer*) e);
+	struct paml_defer_data* dd = pml_defer_get_data((struct pml_defer*) e);
 	if(dd->destroy_cb) {
 		dd->destroy_cb(dd->api, e, dd->data);
 	}
 	free(dd);
-	ml_defer_destroy((struct ml_defer*) e);
+	pml_defer_destroy((struct pml_defer*) e);
 }
 
 static void paml_defer_set_destroy(pa_defer_event* e, pa_defer_event_destroy_cb_t cb) {
-	struct paml_defer_data* dd = ml_defer_get_data((struct ml_defer*) e);
+	struct paml_defer_data* dd = pml_defer_get_data((struct pml_defer*) e);
 	dd->destroy_cb = cb;
 }
 
@@ -278,10 +280,10 @@ static void pactx_state_cb(pa_context* pactx, void* data) {
 	pa_operation_unref(o);
 
 	// nest event loops (re-entrant) just for fun
-	struct mainloop* ml = data;
+	struct pml* pml = data;
 	printf("waiting for pulse event\n");
 	while(run && !pulse_event) {
-		mainloop_iterate(ml, true);
+		pml_iterate(pml, true);
 	}
 	printf("done\n");
 }
@@ -292,17 +294,17 @@ static gboolean player_status_cb(PlayerctlPlayer* player,
 	return true;
 }
 
-static void glib_prepare(struct ml_custom* c) {
-	GMainContext* ctx = ml_custom_get_data(c);
+static void glib_prepare(struct pml_custom* c) {
+	GMainContext* ctx = pml_custom_get_data(c);
 	gint prio;
 	g_main_context_prepare(ctx, &prio);
 }
 
-static unsigned glib_query(struct ml_custom* c, struct pollfd* fds,
+static unsigned glib_query(struct pml_custom* c, struct pollfd* fds,
 		unsigned n_fds, int* timeout) {
 	GPollFD gfds[n_fds + 1];
 	const gint prio = INT_MAX;
-	GMainContext* ctx = ml_custom_get_data(c);
+	GMainContext* ctx = pml_custom_get_data(c);
 	unsigned ret = g_main_context_query(ctx, prio, timeout, gfds, n_fds);
 	for(unsigned i = 0u; i < n_fds; ++i) {
 		fds[i].events = gfds[i].events;
@@ -311,56 +313,56 @@ static unsigned glib_query(struct ml_custom* c, struct pollfd* fds,
 	return ret;
 }
 
-static void glib_dispatch(struct ml_custom* c, struct pollfd* fds, unsigned n_fds) {
+static void glib_dispatch(struct pml_custom* c, struct pollfd* fds, unsigned n_fds) {
 	GPollFD gfds[n_fds + 1];
 	for(unsigned i = 0u; i < n_fds; ++i) {
 		gfds[i].events = fds[i].events;
 		gfds[i].revents = fds[i].revents;
 		gfds[i].fd = fds[i].fd;
 	}
-	GMainContext* ctx = ml_custom_get_data(c);
+	GMainContext* ctx = pml_custom_get_data(c);
 	g_main_context_check(ctx, INT_MAX, gfds, n_fds);
 	g_main_context_dispatch(ctx);
 }
 
-static const struct ml_custom_impl glib_custom_impl = {
+static const struct pml_custom_impl glib_custom_impl = {
 	.prepare = glib_prepare,
 	.query = glib_query,
 	.dispatch = glib_dispatch
 };
 
-void io_destroy_paml_cb(struct ml_io* io) {
-	if(ml_io_get_cb(io) == paml_io_cb) {
+void io_destroy_paml_cb(struct pml_io* io) {
+	if(pml_io_get_cb(io) == paml_io_cb) {
 		paml_io_free((pa_io_event*) io);
 	}
 }
 
-void timer_destroy_paml_cb(struct ml_timer* t) {
-	if(ml_timer_get_cb(t) == paml_time_cb) {
+void timer_destroy_paml_cb(struct pml_timer* t) {
+	if(pml_timer_get_cb(t) == paml_time_cb) {
 		paml_time_free((pa_time_event*) t);
 	}
 }
 
-void defer_destroy_paml_cb(struct ml_defer* d) {
-	if(ml_defer_get_cb(d) == paml_defer_cb) {
+void defer_destroy_paml_cb(struct pml_defer* d) {
+	if(pml_defer_get_cb(d) == paml_defer_cb) {
 		paml_defer_free((pa_defer_event*) d);
 	}
 }
 
 int main() {
-	struct mainloop* ml = mainloop_new();
+	struct pml* pml = pml_new();
 
-	// ml_timer source: triggers once every second
-	struct ml_timer* timer = ml_timer_new(ml, NULL, &timer_cb);
+	// pml_timer source: triggers once every second
+	struct pml_timer* timer = pml_timer_new(pml, NULL, &timer_cb);
 	struct timespec time = { .tv_sec = 5 };
-	ml_timer_set_clock(timer, CLOCK_MONOTONIC);
-	ml_timer_set_time_rel(timer, time);
+	pml_timer_set_clock(timer, CLOCK_MONOTONIC);
+	pml_timer_set_time_rel(timer, time);
 
-	// ml_io source: listing for input to stdin
-	struct ml_io* io = ml_io_new(ml, STDIN_FILENO, POLLIN, &fd_cb);
+	// pml_io source: listing for input to stdin
+	struct pml_io* io = pml_io_new(pml, STDIN_FILENO, POLLIN, &fd_cb);
 	(void) io;
 
-	// ml_custom source: wrap glib's mainloop to use playerctl
+	// pml_custom source: wrap glib's mainloop to use playerctl
 	GError* error = NULL;
 	PlayerctlPlayerManager* manager = playerctl_player_manager_new(&error);
 	if(error != NULL) {
@@ -389,17 +391,17 @@ int main() {
 
 	GMainContext* gctx = g_main_context_default();
 	g_main_context_acquire(gctx);
-	struct ml_custom* glib_custom = ml_custom_new(ml, &glib_custom_impl);
-	ml_custom_set_data(glib_custom, gctx);
+	struct pml_custom* glib_custom = pml_custom_new(pml, &glib_custom_impl);
+	pml_custom_set_data(glib_custom, gctx);
 
-	// pulseaudio: we use the ml mainloop api to implement the pulseaudio
+	// pulseaudio: we use the pml mainloop api to implement the pulseaudio
 	// mainloop interface. The use i developed this for: using this
 	// in a project that doesn't want to give pulseaudio its own thread
 	// but listen for events.
 	struct pa_mainloop_api pa_api = pulse_mainloop_api;
-	pa_api.userdata = ml;
+	pa_api.userdata = pml;
 	pa_context* pactx = pa_context_new(&pa_api, NULL);
-    pa_context_set_state_callback(pactx, pactx_state_cb, ml);
+    pa_context_set_state_callback(pactx, pactx_state_cb, pml);
 
 	if(pa_context_connect(pactx, NULL, 0, NULL) < 0) {
         printf("pa_context_connect() failed: %s", strerror(pa_context_errno(pactx)));
@@ -407,7 +409,7 @@ int main() {
     }
 
 	while(run) {
-		mainloop_iterate(ml, true);
+		pml_iterate(pml, true);
 	}
 
 	g_main_context_release(gctx);
@@ -418,8 +420,8 @@ int main() {
 
 	// We have to destroy the pulse audio (paml) event sources manually
 	// to make sure their data is freed and destruction callbacks triggered
-	mainloop_for_each_io(ml, io_destroy_paml_cb);
-	mainloop_for_each_timer(ml, timer_destroy_paml_cb);
-	mainloop_for_each_defer(ml, defer_destroy_paml_cb);
-	mainloop_destroy(ml);
+	pml_for_each_io(pml, io_destroy_paml_cb);
+	pml_for_each_timer(pml, timer_destroy_paml_cb);
+	pml_for_each_defer(pml, defer_destroy_paml_cb);
+	pml_destroy(pml);
 }

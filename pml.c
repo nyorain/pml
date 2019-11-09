@@ -13,7 +13,7 @@
 // Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public
-// License along with posix_mainloop; if not, see <http://www.gnu.org/licenses/>.
+// License along with pml; if not, see <http://www.gnu.org/licenses/>.
 //
 // NOTE: this doesn't share code with the original pulseaudio implementation,
 // their copyright should probably be removed, right? I looked at their
@@ -25,7 +25,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-#include "mainloop.h"
+#include "pml.h"
 #include <stdlib.h>
 #include <limits.h>
 #include <errno.h>
@@ -37,7 +37,7 @@
 #include <poll.h>
 
 // Ideas:
-// - the number of dispatched events from mainloop_iterate, allowing
+// - the number of dispatched events from pml_iterate, allowing
 //   to dispatch *all* pending events (call it until the number if 0).
 //   Not always possible to implement for custom sources though i guess...
 //   We could instead return if a new source was added/a timer reset
@@ -66,15 +66,15 @@
 // - rebuilding optimizations. On event source destruction
 //   we could just set the fds to -1 (and potentially even re-use
 //   them later on for different fds), instead of rebuilding.
-//   Or: allow to change the fd on a ml_io?
-// - implement (and use in mainloop_iterate):
-// - Maybe also seperate mainloop.n_fds and capacity of mainloop.fds to
+//   Or: allow to change the fd on a pml_io?
+// - implement (and use in pml_iterate):
+// - Maybe also seperate pml.n_fds and capacity of pml.fds to
 //   avoid reallocation in some cases.
 //   ```
-//   // Like `mainloop_dispatch` but additionally takes the return code from ret.
+//   // Like `pml_dispatch` but additionally takes the return code from ret.
 //   // This is only used for internal optimizations such as not even checking
 //   // the returned fds if poll returned an error or 0.
-//   void mainloop_dispatch_with_poll_code(struct mainloop*,
+//   void pml_dispatch_with_poll_code(struct pml*,
 //   	struct pollfd* fds, unsigned n_fds, int poll_code);
 //   ```
 
@@ -89,70 +89,70 @@ enum state {
 	state_dispatch_custom,
 };
 
-struct ml_io {
-	struct ml_io* prev;
-	struct ml_io* next;
-	struct mainloop* mainloop;
+struct pml_io {
+	struct pml_io* prev;
+	struct pml_io* next;
+	struct pml* pml;
 	void* data;
-	ml_io_cb cb;
+	pml_io_cb cb;
 	int fd;
 	unsigned events;
 	unsigned fd_id;
 };
 
-struct ml_timer {
-	struct ml_timer* prev;
-	struct ml_timer* next;
-	struct mainloop* mainloop;
+struct pml_timer {
+	struct pml_timer* prev;
+	struct pml_timer* next;
+	struct pml* pml;
 	struct timespec time;
 	clockid_t clock;
 	bool enabled;
 	void* data;
-	ml_timer_cb cb;
+	pml_timer_cb cb;
 };
 
-struct ml_defer {
-	struct ml_defer* prev;
-	struct ml_defer* next;
-	struct mainloop* mainloop;
+struct pml_defer {
+	struct pml_defer* prev;
+	struct pml_defer* next;
+	struct pml* pml;
 	void* data;
-	ml_defer_cb cb;
+	pml_defer_cb cb;
 	bool enabled;
 };
 
-struct ml_custom {
-	struct ml_custom* prev;
-	struct ml_custom* next;
-	struct mainloop* mainloop;
+struct pml_custom {
+	struct pml_custom* prev;
+	struct pml_custom* next;
+	struct pml* pml;
 	void* data;
-	const struct ml_custom_impl* impl;
+	const struct pml_custom_impl* impl;
 	unsigned fds_id;
 	unsigned n_fds_last;
 };
 
-struct mainloop {
+struct pml {
 	unsigned n_io; // only alive ones
 	unsigned n_fds;
 	struct pollfd* fds;
 
 	struct {
-		struct ml_io* first;
-		struct ml_io* last;
+		struct pml_io* first;
+		struct pml_io* last;
 	} io;
 
 	struct {
-		struct ml_timer* first;
-		struct ml_timer* last;
+		struct pml_timer* first;
+		struct pml_timer* last;
 	} timer;
 
 	struct {
-		struct ml_defer* first;
-		struct ml_defer* last;
+		struct pml_defer* first;
+		struct pml_defer* last;
 	} defer;
 
 	struct {
-		struct ml_custom* first;
-		struct ml_custom* last;
+		struct pml_custom* first;
+		struct pml_custom* last;
 	} custom;
 
 	bool rebuild_fds;
@@ -167,7 +167,7 @@ struct mainloop {
 	enum state state;
 	void* state_data;
 
-	// how many instances of mainloop_dispatch are currently on
+	// how many instances of pml_dispatch are currently on
 	// the stack. Usually this is 0 (not dispatching) or 1 (inside
 	// a dispatch call). When using re-entrancy (only allowed for
 	// callbacks triggered from dispatch) this can get higher.
@@ -185,10 +185,6 @@ static unsigned min(unsigned a, unsigned b) {
 	return a < b ? a : b;
 }
 
-// static unsigned max(unsigned a, unsigned b) {
-// 	return a > b ? a : b;
-// }
-
 static int64_t timespec_ms(const struct timespec* t) {
 	return 1000 * t->tv_sec + t->tv_nsec / (1000 * 1000);
 }
@@ -198,56 +194,49 @@ static void timespec_subtract(struct timespec* a, const struct timespec* minus) 
 	a->tv_sec -= minus->tv_sec;
 }
 
-// static int64_t timespec_ms_from_now(const struct timespec* t) {
-// 	struct timespec diff;
-// 	clock_gettime(CLOCK_REALTIME, &diff);
-// 	timespec_subtract(&diff, t);
-// 	return -timespec_ms(&diff);
-// }
-
-static void destroy_io(struct ml_io* io) {
+static void destroy_io(struct pml_io* io) {
 	assert(io);
 	if(io->next) io->next->prev = io->prev;
 	if(io->prev) io->prev->next = io->next;
-	if(io == io->mainloop->io.first) io->mainloop->io.first = io->next;
-	if(io == io->mainloop->io.last) io->mainloop->io.last = io->prev;
+	if(io == io->pml->io.first) io->pml->io.first = io->next;
+	if(io == io->pml->io.last) io->pml->io.last = io->prev;
 	free(io);
 }
 
-static void destroy_timer(struct ml_timer* t) {
+static void destroy_timer(struct pml_timer* t) {
 	assert(t);
 	if(t->next) t->next->prev = t->prev;
 	if(t->prev) t->prev->next = t->next;
-	if(t == t->mainloop->timer.first) t->mainloop->timer.first = t->next;
-	if(t == t->mainloop->timer.last) t->mainloop->timer.last = t->prev;
+	if(t == t->pml->timer.first) t->pml->timer.first = t->next;
+	if(t == t->pml->timer.last) t->pml->timer.last = t->prev;
 	free(t);
 }
 
-static void destroy_defer(struct ml_defer* d) {
+static void destroy_defer(struct pml_defer* d) {
 	assert(d);
 	if(d->next) d->next->prev = d->prev;
 	if(d->prev) d->prev->next = d->next;
-	if(d == d->mainloop->defer.first) d->mainloop->defer.first = d->next;
-	if(d == d->mainloop->defer.last) d->mainloop->defer.last = d->prev;
+	if(d == d->pml->defer.first) d->pml->defer.first = d->next;
+	if(d == d->pml->defer.last) d->pml->defer.last = d->prev;
 	free(d);
 }
 
-static void destroy_custom(struct ml_custom* c) {
+static void destroy_custom(struct pml_custom* c) {
 	assert(c);
 	if(c->next) c->next->prev = c->prev;
 	if(c->prev) c->prev->next = c->next;
-	if(c == c->mainloop->custom.first) c->mainloop->custom.first = c->next;
-	if(c == c->mainloop->custom.last) c->mainloop->custom.last = c->prev;
+	if(c == c->pml->custom.first) c->pml->custom.first = c->next;
+	if(c == c->pml->custom.last) c->pml->custom.last = c->prev;
 	free(c);
 }
 
 // mainloop
-struct mainloop* mainloop_new(void) {
-	struct mainloop* ml = calloc(1, sizeof(*ml));
+struct pml* pml_new(void) {
+	struct pml* ml = calloc(1, sizeof(*ml));
 	return ml;
 }
 
-void mainloop_destroy(struct mainloop* ml) {
+void pml_destroy(struct pml* ml) {
 	if(!ml) {
 		return;
 	}
@@ -259,23 +248,23 @@ void mainloop_destroy(struct mainloop* ml) {
 	}
 
 	// free all sources
-	for(struct ml_custom* c = ml->custom.first; c;) {
-		struct ml_custom* n = c->next;
+	for(struct pml_custom* c = ml->custom.first; c;) {
+		struct pml_custom* n = c->next;
 		free(c);
 		c = n;
 	}
-	for(struct ml_io* c = ml->io.first; c;) {
-		struct ml_io* n = c->next;
+	for(struct pml_io* c = ml->io.first; c;) {
+		struct pml_io* n = c->next;
 		free(c);
 		c = n;
 	}
-	for(struct ml_defer* c = ml->defer.first; c;) {
-		struct ml_defer* n = c->next;
+	for(struct pml_defer* c = ml->defer.first; c;) {
+		struct pml_defer* n = c->next;
 		free(c);
 		c = n;
 	}
-	for(struct ml_timer* c = ml->timer.first; c;) {
-		struct ml_timer* n = c->next;
+	for(struct pml_timer* c = ml->timer.first; c;) {
+		struct pml_timer* n = c->next;
 		free(c);
 		c = n;
 	}
@@ -283,14 +272,14 @@ void mainloop_destroy(struct mainloop* ml) {
 	free(ml);
 }
 
-void mainloop_prepare(struct mainloop* ml) {
+void pml_prepare(struct pml* ml) {
 	assert(ml);
 	assert((ml->state == state_none || is_dispatch_state(ml->state)) &&
-		"Invalid state of mainloop for mainloop_prepare");
+		"Invalid state of mainloop for pml_prepare");
 
 	// dispatching isn't finished yet, just continue it
-	// mainloop_poll will detect that as well, but we set the timeout
-	// to zero so we can return it from mainloop_query
+	// pml_poll will detect that as well, but we set the timeout
+	// to zero so we can return it from pml_query
 	if(ml->state != state_none) {
 		ml->prepared_timeout = 0;
 		return;
@@ -305,7 +294,7 @@ void mainloop_prepare(struct mainloop* ml) {
 
 	// prepare custom sources
 	unsigned n_fds = ml->n_io;
-	for(struct ml_custom* c = ml->custom.first; c; c = c->next) {
+	for(struct pml_custom* c = ml->custom.first; c; c = c->next) {
 		if(c->impl->prepare) {
 			c->impl->prepare(c);
 		}
@@ -334,7 +323,7 @@ void mainloop_prepare(struct mainloop* ml) {
 	struct timespec now;
 	clockid_t clk = CLOCK_REALTIME;
 	clock_gettime(clk, &now);
-	for(struct ml_timer* t = ml->timer.first; t; t = t->next) {
+	for(struct pml_timer* t = ml->timer.first; t; t = t->next) {
 		if(!t->enabled) {
 			continue;
 		}
@@ -361,14 +350,14 @@ void mainloop_prepare(struct mainloop* ml) {
 		ml->n_fds = n_fds;
 
 		unsigned i = 0u;
-		for(struct ml_io* io = ml->io.first; io; io = io->next) {
+		for(struct pml_io* io = ml->io.first; io; io = io->next) {
 			ml->fds[i].fd = io->fd;
 			ml->fds[i].events = io->events;
 			io->fd_id = i;
 			++i;
 		}
 
-		for(struct ml_custom* c = ml->custom.first; c; c = c->next) {
+		for(struct pml_custom* c = ml->custom.first; c; c = c->next) {
 			int timeout;
 			unsigned count = c->impl->query(c, &ml->fds[i], c->n_fds_last, &timeout);
 			assert(count == c->n_fds_last &&
@@ -386,10 +375,10 @@ void mainloop_prepare(struct mainloop* ml) {
 	return;
 }
 
-int mainloop_poll(struct mainloop* ml, int timeout) {
+int pml_poll(struct pml* ml, int timeout) {
 	assert(ml);
 	assert((ml->state == state_prepared || is_dispatch_state(ml->state)) &&
-		"Invalid mainloop state for calling mainloop_poll");
+		"Invalid mainloop state for calling pml_poll");
 
 	// dispatching not finished yet, we can skip polling.
 	if(ml->state != state_prepared) {
@@ -403,17 +392,17 @@ int mainloop_poll(struct mainloop* ml, int timeout) {
 	} while(ret < 0 && errno == EINTR);
 
 	if(ret < 0) {
-		fprintf(stderr, "mainloop poll: %s (%d)\n", strerror(errno), errno);
+		fprintf(stderr, "pml_poll: %s (%d)\n", strerror(errno), errno);
 	}
 
 	ml->state = state_polled;
 	return ret;
 }
 
-static bool dispatch_defer(struct mainloop* ml) {
+static bool dispatch_defer(struct pml* ml) {
 	// If we are continuing defer dispatching, the source to dispatch
 	// is stored in state_data. Otherwise we start with the first one.
-	struct ml_defer* d = ml->defer.first;
+	struct pml_defer* d = ml->defer.first;
 	if(ml->state == state_dispatch_defer) {
 		d = ml->state_data;
 	}
@@ -450,8 +439,8 @@ static bool dispatch_defer(struct mainloop* ml) {
 	return ml->state == state_dispatch_defer;
 }
 
-static bool dispatch_timer(struct mainloop* ml) {
-	struct ml_timer* t = ml->timer.first;
+static bool dispatch_timer(struct pml* ml) {
+	struct pml_timer* t = ml->timer.first;
 	if(ml->state == state_dispatch_timer) {
 		t = ml->state_data;
 	}
@@ -486,8 +475,8 @@ static bool dispatch_timer(struct mainloop* ml) {
 	return ml->state == state_dispatch_timer;
 }
 
-static bool dispatch_io(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) {
-	struct ml_io* io = ml->io.first;
+static bool dispatch_io(struct pml* ml, struct pollfd* fds, unsigned n_fds) {
+	struct pml_io* io = ml->io.first;
 	if(ml->state == state_dispatch_io) {
 		io = ml->state_data;
 	}
@@ -502,8 +491,7 @@ static bool dispatch_io(struct mainloop* ml, struct pollfd* fds, unsigned n_fds)
 			continue;
 		}
 
-		assert(io->fd_id < n_fds &&
-			"Not enough fds passed to mainloop_dispatch");
+		assert(io->fd_id < n_fds && "Not enough fds passed to pml_dispatch");
 		struct pollfd* fd = &fds[io->fd_id];
 		assert(fd->fd >= 0);
 
@@ -521,9 +509,9 @@ static bool dispatch_io(struct mainloop* ml, struct pollfd* fds, unsigned n_fds)
 	return ml->state == state_dispatch_io;
 }
 
-static bool dispatch_custom(struct mainloop* ml, struct pollfd* fds,
+static bool dispatch_custom(struct pml* ml, struct pollfd* fds,
 		unsigned n_fds) {
-	struct ml_custom* c = ml->custom.first;
+	struct pml_custom* c = ml->custom.first;
 	if(ml->state == state_dispatch_custom) {
 		c = ml->state_data;
 	}
@@ -540,7 +528,7 @@ static bool dispatch_custom(struct mainloop* ml, struct pollfd* fds,
 		}
 
 		assert(c->fds_id + c->n_fds_last <= n_fds
-			&& "Not enough fds passed to mainloop_dispatch");
+			&& "Not enough fds passed to pml_dispatch");
 		struct pollfd* fd = &fds[c->fds_id];
 		c->impl->dispatch(c, fd, c->n_fds_last);
 	}
@@ -550,12 +538,12 @@ static bool dispatch_custom(struct mainloop* ml, struct pollfd* fds,
 	return ml->state == state_dispatch_custom;
 }
 
-void mainloop_dispatch(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) {
+void pml_dispatch(struct pml* ml, struct pollfd* fds, unsigned n_fds) {
 	assert(ml);
 	assert((fds || !n_fds) &&
-		"fds = NULL but n_fds != 0 passed to mainloop_dispatch");
+		"fds = NULL but n_fds != 0 passed to pml_dispatch");
 	assert((ml->state == state_polled || is_dispatch_state(ml->state)) &&
-		"Invalid mainloop state for calling mainloop_dispatch");
+		"Invalid mainloop state for calling pml_dispatch");
 	unsigned depth = ml->dispatch_depth;
 	++ml->dispatch_depth;
 
@@ -581,31 +569,31 @@ void mainloop_dispatch(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) 
 	ml->state_data = NULL;
 }
 
-int mainloop_iterate(struct mainloop* ml, bool block) {
+int pml_iterate(struct pml* ml, bool block) {
 	assert(ml);
 
-	mainloop_prepare(ml);
+	pml_prepare(ml);
 	if(!block) {
 		ml->prepared_timeout = 0;
 	}
 
-	int ret = mainloop_poll(ml, ml->prepared_timeout);
-	mainloop_dispatch(ml, ml->fds, ml->n_fds);
+	int ret = pml_poll(ml, ml->prepared_timeout);
+	pml_dispatch(ml, ml->fds, ml->n_fds);
 	return ret;
 }
 
-unsigned mainloop_query(struct mainloop* ml, struct pollfd* fds,
+unsigned pml_query(struct pml* ml, struct pollfd* fds,
 		unsigned n_fds, int* timeout) {
 	assert(ml);
-	assert(timeout && "timeout = NULL passed to mainloop_query");
+	assert(timeout && "timeout = NULL passed to pml_query");
 	assert((!n_fds || fds) &&
-		"fds = NULL but n_fds != 0 passed to mainloop_query");
+		"fds = NULL but n_fds != 0 passed to pml_query");
 	assert((ml->state == state_prepared || is_dispatch_state(ml->state)) &&
-		"Invalid mainloop state for calling mainloop_query");
+		"Invalid mainloop state for calling pml_query");
 
 	// if dispatching isn't finished yet (i.e. is_dispatch_state_ml->state),
 	// we still have to return the valid fds so we receive them
-	// in mainloop_dispatch. ml->prepared_timeout was already set to 0
+	// in pml_dispatch. ml->prepared_timeout was already set to 0
 	// though
 	unsigned size = min(n_fds, ml->n_fds) * sizeof(*fds);
 	memcpy(fds, ml->fds, size);
@@ -613,61 +601,61 @@ unsigned mainloop_query(struct mainloop* ml, struct pollfd* fds,
 	return ml->n_fds;
 }
 
-void mainloop_for_each_io(struct mainloop* ml, void (*cb)(struct ml_io*)) {
+void pml_for_each_io(struct pml* ml, void (*cb)(struct pml_io*)) {
 	assert(ml);
 	assert(cb);
 
-	struct ml_io* io;
-	struct ml_io* next = ml->io.first;
+	struct pml_io* io;
+	struct pml_io* next = ml->io.first;
 	while((io = next)) {
 		next = io->next;
 		cb(io);
 	}
 }
 
-void mainloop_for_each_timer(struct mainloop* ml, void (*cb)(struct ml_timer*)) {
+void pml_for_each_timer(struct pml* ml, void (*cb)(struct pml_timer*)) {
 	assert(ml);
 	assert(cb);
 
-	struct ml_timer* x;
-	struct ml_timer* next = ml->timer.first;
+	struct pml_timer* x;
+	struct pml_timer* next = ml->timer.first;
 	while((x = next)) {
 		next = x->next;
 		cb(x);
 	}
 }
 
-void mainloop_for_each_defer(struct mainloop* ml, void (*cb)(struct ml_defer*)) {
-	struct ml_defer* x;
-	struct ml_defer* next = ml->defer.first;
+void pml_for_each_defer(struct pml* ml, void (*cb)(struct pml_defer*)) {
+	struct pml_defer* x;
+	struct pml_defer* next = ml->defer.first;
 	while((x = next)) {
 		next = x->next;
 		cb(x);
 	}
 }
 
-void mainloop_for_each_custom(struct mainloop* ml, void (*cb)(struct ml_custom*)) {
+void pml_for_each_custom(struct pml* ml, void (*cb)(struct pml_custom*)) {
 	assert(ml);
 	assert(cb);
 
-	struct ml_custom* x;
-	struct ml_custom* next = ml->custom.first;
+	struct pml_custom* x;
+	struct pml_custom* next = ml->custom.first;
 	while((x = next)) {
 		next = x->next;
 		cb(x);
 	}
 }
 
-// ml_io
-struct ml_io* ml_io_new(struct mainloop* ml, int fd,
-		unsigned events, ml_io_cb cb) {
+// pml_io
+struct pml_io* pml_io_new(struct pml* ml, int fd,
+		unsigned events, pml_io_cb cb) {
 	assert(ml);
 	assert(fd >= 0);
 	assert((events & (POLLERR | POLLHUP | POLLNVAL)) == 0);
 	assert(cb);
 
-	struct ml_io* io = calloc(1, sizeof(*io));
-	io->mainloop = ml;
+	struct pml_io* io = calloc(1, sizeof(*io));
+	io->pml = ml;
 	io->fd = fd;
 	io->events = events;
 	io->cb = cb;
@@ -687,27 +675,27 @@ struct ml_io* ml_io_new(struct mainloop* ml, int fd,
 	return io;
 }
 
-void ml_io_set_data(struct ml_io* io, void* data) {
+void pml_io_set_data(struct pml_io* io, void* data) {
 	assert(io);
 	io->data = data;
 }
 
-void* ml_io_get_data(struct ml_io* io) {
+void* pml_io_get_data(struct pml_io* io) {
 	assert(io);
 	return io->data;
 }
 
-int ml_io_get_fd(struct ml_io* io) {
+int pml_io_get_fd(struct pml_io* io) {
 	assert(io);
 	return io->fd;
 }
 
-void ml_io_destroy(struct ml_io* io) {
+void pml_io_destroy(struct pml_io* io) {
 	if(!io) {
 		return;
 	}
 
-	struct mainloop* ml = io->mainloop;
+	struct pml* ml = io->pml;
 	assert(ml);
 
 	--ml->n_io;
@@ -718,7 +706,7 @@ void ml_io_destroy(struct ml_io* io) {
 
 	// in re-rentrant situations, the current fds array might be
 	// returned from query without being rebuild after this.
-	// mainloop_iterate itself won't poll but when the mainloop is
+	// pml_iterate itself won't poll but when the mainloop is
 	// integrated externally that might happen.
 	// Since the fd might be destroyed after this and no longer be
 	// valid, we just unset it here (poll ignores .fd = -1 entries)
@@ -737,37 +725,37 @@ void ml_io_destroy(struct ml_io* io) {
 	destroy_io(io);
 }
 
-void ml_io_set_events(struct ml_io* io, unsigned events) {
+void pml_io_set_events(struct pml_io* io, unsigned events) {
 	assert(io);
 	io->events = events;
-	if(io->fd_id != UINT_MAX && !io->mainloop->rebuild_fds) {
-		io->mainloop->fds[io->fd_id].events = events;
+	if(io->fd_id != UINT_MAX && !io->pml->rebuild_fds) {
+		io->pml->fds[io->fd_id].events = events;
 	}
 }
 
-unsigned ml_io_get_events(struct ml_io* io) {
+unsigned pml_io_get_events(struct pml_io* io) {
 	return io->events;
 }
 
-struct mainloop* ml_io_get_mainloop(struct ml_io* io) {
+struct pml* pml_io_get_pml(struct pml_io* io) {
 	assert(io);
-	assert(io->mainloop);
-	return io->mainloop;
+	assert(io->pml);
+	return io->pml;
 }
 
-ml_io_cb ml_io_get_cb(struct ml_io* io) {
+pml_io_cb pml_io_get_cb(struct pml_io* io) {
 	assert(io);
 	return io->cb;
 }
 
-// ml_timer
-struct ml_timer* ml_timer_new(struct mainloop* ml,
-		const struct timespec* time, ml_timer_cb cb) {
+// pml_timer
+struct pml_timer* pml_timer_new(struct pml* ml,
+		const struct timespec* time, pml_timer_cb cb) {
 	assert(ml);
 	assert(cb);
 
-	struct ml_timer* timer = calloc(1, sizeof(*timer));
-	timer->mainloop = ml;
+	struct pml_timer* timer = calloc(1, sizeof(*timer));
+	timer->pml = ml;
 	timer->cb = cb;
 	timer->clock = CLOCK_REALTIME;
 	timer->enabled = time;
@@ -786,13 +774,13 @@ struct ml_timer* ml_timer_new(struct mainloop* ml,
 	return timer;
 }
 
-void ml_timer_set_time(struct ml_timer* timer, struct timespec time) {
+void pml_timer_set_time(struct pml_timer* timer, struct timespec time) {
 	assert(timer);
 	timer->enabled = true;
 	timer->time = time;
 }
 
-int ml_timer_set_time_rel(struct ml_timer* timer, struct timespec time) {
+int pml_timer_set_time_rel(struct pml_timer* timer, struct timespec time) {
 	assert(timer);
 	int res = clock_gettime(timer->clock, &timer->time);
 	if(res != 0) {
@@ -807,75 +795,75 @@ int ml_timer_set_time_rel(struct ml_timer* timer, struct timespec time) {
 	return 0;
 }
 
-bool ml_timer_is_enabled(struct ml_timer* timer) {
+bool pml_timer_is_enabled(struct pml_timer* timer) {
 	assert(timer);
 	return timer->enabled;
 }
 
-void ml_timer_disable(struct ml_timer* timer) {
+void pml_timer_disable(struct pml_timer* timer) {
 	assert(timer);
 	timer->enabled = false;
 }
 
-void ml_timer_set_clock(struct ml_timer* timer, ml_clockid clock) {
+void pml_timer_set_clock(struct pml_timer* timer, pml_clockid clock) {
 	assert(timer);
 	timer->clock = clock;
 	timer->enabled = false;
 }
 
-struct timespec ml_timer_get_time(struct ml_timer* timer) {
+struct timespec pml_timer_get_time(struct pml_timer* timer) {
 	assert(timer);
 	return timer->time;
 }
 
-clockid_t ml_timer_get_clock(struct ml_timer* timer) {
+clockid_t pml_timer_get_clock(struct pml_timer* timer) {
 	assert(timer);
 	return timer->clock;
 }
 
-void ml_timer_set_data(struct ml_timer* timer, void* data) {
+void pml_timer_set_data(struct pml_timer* timer, void* data) {
 	assert(timer);
 	timer->data = data;
 }
 
-void* ml_timer_get_data(struct ml_timer* timer) {
+void* pml_timer_get_data(struct pml_timer* timer) {
 	assert(timer);
 	return timer->data;
 }
 
-void ml_timer_destroy(struct ml_timer* timer) {
+void pml_timer_destroy(struct pml_timer* timer) {
 	if(!timer) {
 		return;
 	}
 
-	assert(timer->mainloop);
-	if(timer->mainloop->state_data == timer) {
-		assert(timer->mainloop->state == state_dispatch_timer);
-		timer->mainloop->state_data = timer->next;
+	assert(timer->pml);
+	if(timer->pml->state_data == timer) {
+		assert(timer->pml->state == state_dispatch_timer);
+		timer->pml->state_data = timer->next;
 	}
 
 	destroy_timer(timer);
 }
 
-struct mainloop* ml_timer_get_mainloop(struct ml_timer* timer) {
+struct pml* pml_timer_get_pml(struct pml_timer* timer) {
 	assert(timer);
-	assert(timer->mainloop);
-	return timer->mainloop;
+	assert(timer->pml);
+	return timer->pml;
 }
 
-ml_timer_cb ml_timer_get_cb(struct ml_timer* timer) {
+pml_timer_cb pml_timer_get_cb(struct pml_timer* timer) {
 	assert(timer);
 	return timer->cb;
 }
 
-// ml_defer
-struct ml_defer* ml_defer_new(struct mainloop* ml, ml_defer_cb cb) {
+// pml_defer
+struct pml_defer* pml_defer_new(struct pml* ml, pml_defer_cb cb) {
 	assert(ml);
 	assert(cb);
 
-	struct ml_defer* defer = calloc(1, sizeof(*defer));
+	struct pml_defer* defer = calloc(1, sizeof(*defer));
 	defer->cb = cb;
-	defer->mainloop = ml;
+	defer->pml = ml;
 	defer->enabled = true;
 	++ml->n_enabled_defered;
 
@@ -890,7 +878,7 @@ struct ml_defer* ml_defer_new(struct mainloop* ml, ml_defer_cb cb) {
 	return defer;
 }
 
-void ml_defer_enable(struct ml_defer* defer, bool enable) {
+void pml_defer_enable(struct pml_defer* defer, bool enable) {
 	assert(defer);
 	if(defer->enabled == enable) {
 		return;
@@ -898,60 +886,60 @@ void ml_defer_enable(struct ml_defer* defer, bool enable) {
 
 	defer->enabled = enable;
 	if(defer->enabled) {
-		++defer->mainloop->n_enabled_defered;
+		++defer->pml->n_enabled_defered;
 	} else {
-		--defer->mainloop->n_enabled_defered;
+		--defer->pml->n_enabled_defered;
 	}
 }
 
-void ml_defer_set_data(struct ml_defer* defer, void* data) {
+void pml_defer_set_data(struct pml_defer* defer, void* data) {
 	assert(defer);
 	defer->data = data;
 }
 
-void* ml_defer_get_data(struct ml_defer* defer) {
+void* pml_defer_get_data(struct pml_defer* defer) {
 	assert(defer);
 	return defer->data;
 }
 
-void ml_defer_destroy(struct ml_defer* defer) {
+void pml_defer_destroy(struct pml_defer* defer) {
 	if(!defer) {
 		return;
 	}
 
-	assert(defer->mainloop);
+	assert(defer->pml);
 	if(defer->enabled) {
-		--defer->mainloop->n_enabled_defered;
+		--defer->pml->n_enabled_defered;
 	}
 
-	if(defer->mainloop->state_data == defer) {
-		assert(defer->mainloop->state == state_dispatch_defer);
-		defer->mainloop->state_data = defer->next;
+	if(defer->pml->state_data == defer) {
+		assert(defer->pml->state == state_dispatch_defer);
+		defer->pml->state_data = defer->next;
 	}
 
 	destroy_defer(defer);
 }
 
-struct mainloop* ml_defer_get_mainloop(struct ml_defer* defer) {
+struct pml* pml_defer_get_pml(struct pml_defer* defer) {
 	assert(defer);
-	assert(defer->mainloop);
-	return defer->mainloop;
+	assert(defer->pml);
+	return defer->pml;
 }
 
-ml_defer_cb ml_defer_get_cb(struct ml_defer* defer) {
+pml_defer_cb pml_defer_get_cb(struct pml_defer* defer) {
 	assert(defer);
 	return defer->cb;
 }
 
-// ml_custom
-struct ml_custom* ml_custom_new(struct mainloop* ml, const struct ml_custom_impl* impl) {
+// pml_custom
+struct pml_custom* pml_custom_new(struct pml* ml, const struct pml_custom_impl* impl) {
 	assert(ml);
 	assert(impl);
 	assert(impl->dispatch);
 	assert(impl->query);
 
-	struct ml_custom* custom = calloc(1, sizeof(*custom));
-	custom->mainloop = ml;
+	struct pml_custom* custom = calloc(1, sizeof(*custom));
+	custom->pml = ml;
 	custom->impl = impl;
 	custom->fds_id = UINT_MAX;
 
@@ -966,22 +954,22 @@ struct ml_custom* ml_custom_new(struct mainloop* ml, const struct ml_custom_impl
 	return custom;
 }
 
-void ml_custom_set_data(struct ml_custom* custom, void* data) {
+void pml_custom_set_data(struct pml_custom* custom, void* data) {
 	assert(custom);
 	custom->data = data;
 }
 
-void* ml_custom_get_data(struct ml_custom* custom) {
+void* pml_custom_get_data(struct pml_custom* custom) {
 	assert(custom);
 	return custom->data;
 }
 
-void ml_custom_destroy(struct ml_custom* custom) {
+void pml_custom_destroy(struct pml_custom* custom) {
 	if(!custom) {
 		return;
 	}
 
-	struct mainloop* ml = custom->mainloop;
+	struct pml* ml = custom->pml;
 	assert(ml);
 
 	if(ml->state_data == custom) {
@@ -989,7 +977,7 @@ void ml_custom_destroy(struct ml_custom* custom) {
 		ml->state_data = custom->next;
 	}
 
-	// See ml_io_destroy for the reasoning. Basically: query (and external
+	// See pml_io_destroy for the reasoning. Basically: query (and external
 	// polling) might happen before rebuilding
 	assert(!custom->n_fds_last || custom->fds_id != UINT_MAX);
 	for(unsigned i = 0u; i < custom->n_fds_last; ++i) {
@@ -1005,13 +993,13 @@ void ml_custom_destroy(struct ml_custom* custom) {
 	destroy_custom(custom);
 }
 
-struct mainloop* ml_custom_get_mainloop(struct ml_custom* custom) {
+struct pml* pml_custom_get_pml(struct pml_custom* custom) {
 	assert(custom);
-	assert(custom->mainloop);
-	return custom->mainloop;
+	assert(custom->pml);
+	return custom->pml;
 }
 
-const struct ml_custom_impl* ml_custom_get_impl(struct ml_custom* custom) {
+const struct pml_custom_impl* pml_custom_get_impl(struct pml_custom* custom) {
 	assert(custom);
 	return custom->impl;
 }

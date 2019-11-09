@@ -1,5 +1,5 @@
 project(
-	'ml',
+	'pml',
 	'c',
 	version: '0.1.0',
 	license: 'MIT',
@@ -21,30 +21,40 @@ add_project_arguments(
 	language: 'c',
 )
 
+pml_inc = include_directories('.')
+pml_lib = library('pml', ['pml.c'], install: true)
+pml_dep = declare_dependency(
+	include_directories: pml_inc,
+	version: meson.project_version(),
+	link_with: pml_lib)
 
-lib_ml = library('posix_mainloop', ['mainloop.c'],
-	install: true)
+install_headers('pml.h')
 
-posix_mainloop_dep = declare_dependency(
-	include_directories: [include_directories('.')],
-	link_with: lib_ml)
+pkg = import('pkgconfig')
+pkg.generate(
+	pml_lib,
+	name: 'pml',
+	version: meson.project_version(),
+	url: 'https://github.com/nyorain/pml',
+	description: 'Simple POSIX mainloop for C')
 
+# other stuff, examples & tests
 if get_option('examples')
 	dep_pulse = dependency('libpulse')
 	dep_playerctl = dependency('playerctl')
-	executable('mlexample',
+	executable('pmlexample',
 		'example.c',
-		dependencies: [dep_pulse, dep_playerctl, posix_mainloop_dep])
+		dependencies: [dep_pulse, dep_playerctl, pml_dep])
 endif
 
 if get_option('tests')
-	mltest_nested = executable('mltest-nested',
+	mltest_nested = executable('test-nested',
 		'test-nested.c',
-		dependencies: [posix_mainloop_dep])
+		dependencies: [pml_dep])
 	test('nested', mltest_nested)
 
-	mltest_nested_destroy = executable('mltest-nested-destroy',
+	mltest_nested_destroy = executable('test-nested-destroy',
 		'test-nested-destroy.c',
-		dependencies: [posix_mainloop_dep])
+		dependencies: [pml_dep])
 	test('nested-destroy', mltest_nested_destroy)
 endif
