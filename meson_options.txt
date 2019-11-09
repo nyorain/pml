@@ -1,0 +1,3 @@
+option('examples', type: 'boolean', value: 'true', description: 'Build examples')
+option('tests', type: 'boolean', value: 'true', description: 'Build tests')
+

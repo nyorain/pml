@@ -7,13 +7,16 @@ unsigned count = 0u;
 void defer_cb(struct ml_defer* d) {
 	printf("nested iteration %d\n", count);
 	++count;
-	if(count < 10) {
-		// finish the current iteration
-		mainloop_iterate(ml_defer_get_mainloop(d), true);
-
-		// start a new iteration that should trigger the defer source again
-		mainloop_iterate(ml_defer_get_mainloop(d), true);
+	struct mainloop* ml = ml_defer_get_mainloop(d);
+	if(count == 2) {
+		ml_defer_destroy(d);
 	}
+
+	// finish the current iteration
+	mainloop_iterate(ml, false);
+
+	// start a new iteration that should trigger the defer source again
+	mainloop_iterate(ml, false);
 }
 
 int main() {
@@ -22,5 +25,6 @@ int main() {
 
 	mainloop_iterate(ml, true);
 	mainloop_destroy(ml);
-	assert(count == 10);
+	assert(count == 2);
 }
+

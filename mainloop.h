@@ -148,9 +148,14 @@ struct mainloop* ml_io_get_mainloop(struct ml_io*);
 // ml_timer
 // The passed timerspec values represent the timepoints using CLOCK_REALTIME
 // at which the timer should be triggered. They don't represent intervals.
+// The timer callback is called with the timespec at which it should have
+// been triggered (since timers are always delayed by a small amount of
+// time).
 typedef void (*ml_timer_cb)(struct ml_timer* e, const struct timespec*);
 
+// Pass a null timespec to disable the timer.
 struct ml_timer* ml_timer_new(struct mainloop*, const struct timespec*, ml_timer_cb);
+// Pass a null timespec to disable the timer.
 void ml_timer_restart(struct ml_timer*, const struct timespec*);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
@@ -221,7 +226,7 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // Waking the mainloop up from mainloop_iterate or mainloop_poll
 // from another thread is not possible. If an application needs this feature,
 // it can easily implement it as well as the mainloop could
-// do it internally by adding a ml_io with a one side of a pipe and
+// do it internally by adding a ml_io with one side of a pipe and
 // then simply write to the other end when wishing to wake up the
 // polling. On linux, this can be done even more efficiently using
 // eventfds.
@@ -231,8 +236,8 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 //
 // Neither mainloop nor event sources have any internal synchronization
 // mechanisms. They also won't start any helper threads.
-// That means, applications can use externally synchronize access to
-// the mainloop and its sources, when needed.
+// That means, applications can (and have to) use external synchronization
+// to acess the mainloop and its sources, when needed.
 // Since the mainloop doesn't use any global state, it is also possible
 // to just multiple mainloops, e.g. one per thread.
 //
@@ -253,13 +258,13 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // || mainloop_iterate
 // ||| another callback that destroys source S
 // || access source S. It is destroyed now though. Undefined behavior.
-// If an event source nests an iteration, it must be prepared that its
-// own source might have been destroyed. The mainloop will give no
-// guarantees of keeping sources alive while they are in a callback
-// if the source associated with the callback is destroyed during it.
+// If an event source nests an iteration in which callbacks that destroy
+// the event source might be called, it must be prepared that it
+// might have been destroyed afterwards. The mainloop will give no
+// guarantees of keeping sources alive while they are in a callback.
 // It will otherwise be prepared for this case though.
 // The same counts for this even simpler scenario, here it becomes more
-// obvious that any logic keeping S alive would be unexpected.
+// obvious that any logic keeping event sources alive would be unexpected.
 // | mainloop_iterate
 // || some callback on source S
 // ||| destroy(S)
@@ -267,8 +272,8 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // Otherwise it is perfectly valid to destroy an event source from
 // within its own callback. It just must not be used in any way afterwards.
 //
-// After an enable/disable or timer restart call returns its semantics have
-// effect. There won't be any delayed callbacks afterwards from a higher
+// Enabling/disabling defer sources or restarting timers takes effect
+// immediately. There won't be any delayed callbacks afterwards from a previuos
 // mainloop iteration level. The same is true for fd events, there won't
 // be any delayed false positives for events that weren't requested.
 //
@@ -284,14 +289,14 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // - query or dispatch will never be called without prepare being called first
 // - after prepare being called, there will be exactly one call of
 //   dispatch before prepare might be called again. This call will not
-//   happen if the source is destroyed in between though.
+//   happen if source or mainloop is destroyed in between though.
 // - calls to query will only happen between a call to prepare and dispatch
 // The conditions holds true even when the mainloop is using in re-entrant
 // scenarios. Dispatch counts as called as soon as the callback starts.
 // That means, if the custom implementation starts a mainloop iteration
 // from within its dispatch callack, prepared might be called again.
 // In turn, custom implementations are required to always return the
-// same values from 'query' if 'prepared' wasn't called. They furthermore
-// must not access the mainloop (i.e. start an iteration or use
-// the detailed iteration iteration api) in any way during 'prepare' or
-// 'query'
+// same values from 'query' if 'prepared' wasn't called in between.
+// They furthermore must not access the mainloop (i.e. start an iteration or
+// use the detailed iteration iteration api) in any way during 'prepare' or
+// 'query'.

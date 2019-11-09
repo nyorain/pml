@@ -33,6 +33,7 @@
 // And then calculate the timeout from that at the end of prepare.
 // For custom event sources: simply add timeout to the time 'query' was
 // called. Not sure if this is really needed though.
+// Maybe change the custom interface to use timespec instead?
 // TODO: support other clocks than CLOCK_REALTIME, e.g. MONOTONIC
 // interface would probably look like:
 // void ml_timer_restart(struct ml_timer*, struct timespec*, clockid_t clock);
@@ -40,6 +41,10 @@
 // also allow changing the implementation of a custom event source?
 // that doesn't make much sense though... Maybe rather keep these things
 // immutable?
+// TODO: abolish ml_io_flags and just use the POLLXXX values?
+// we use struct pollfd in the public interface already anyways...
+// also better handling (and documentation) of POLLERR/POLLHUP and
+// also POLLNVAL (handle that internally?)
 //
 // Ideas:
 // - the number of dispatched events from mainloop_iterate, allowing
@@ -48,6 +53,8 @@
 //   We could instead return if a new source was added/a timer reset
 //   since then or something, that should be equivalent as we already
 //   dispatch all.
+// - add idle event sources? or set a flag in defer sources whether
+//   they are urgent or not?
 //
 // Optimizations:
 // - implement the various caches and optimizations that keep track of
@@ -59,6 +66,8 @@
 //   them later on for different fds), instead of rebuilding.
 //   Or: allow to change the fd on a ml_io?
 // - implement (and use in mainloop_iterate):
+// - Maybe also seperate mainloop.n_fds and capacity of mainloop.fds to
+//   avoid reallocation in some cases.
 // ```
 // // Like `mainloop_dispatch` but additionally takes the return code from ret.
 // // This is only used for internal optimizations such as not even checking
@@ -257,7 +266,8 @@ void mainloop_destroy(struct mainloop* ml) {
 		return;
 	}
 
-	assert(ml->dispatch_depth == 0);
+	assert(ml->dispatch_depth == 0 &&
+		"Destroying a mainloop that is still dispatching");
 	if(ml->fds) {
 		free(ml->fds);
 	}
@@ -289,7 +299,8 @@ void mainloop_destroy(struct mainloop* ml) {
 
 void mainloop_prepare(struct mainloop* ml) {
 	assert(ml);
-	assert(ml->state == state_none || is_dispatch_state(ml->state));
+	assert((ml->state == state_none || is_dispatch_state(ml->state)) &&
+		"Invalid state of mainloop for mainloop_prepare");
 
 	// dispatching isn't finished yet, just continue it
 	// mainloop_poll will detect that as well, but we set the timeout
@@ -385,7 +396,8 @@ void mainloop_prepare(struct mainloop* ml) {
 
 int mainloop_poll(struct mainloop* ml, int timeout) {
 	assert(ml);
-	assert(ml->state == state_prepared || is_dispatch_state(ml->state));
+	assert((ml->state == state_prepared || is_dispatch_state(ml->state)) &&
+		"Invalid mainloop state for calling mainloop_poll");
 
 	// dispatching not finished yet, we can skip polling.
 	if(ml->state != state_prepared) {
@@ -416,16 +428,19 @@ static bool dispatch_defer(struct mainloop* ml) {
 	// This idiom is used for the other dispatch functions as well.
 	// We store the state here and always set state_data to the next
 	// source that is to be dispatched. When a callback then starts
-	// a new mainloop iteration (i.e. uses re-entrancy), it detects
-	// this case and continues dispatching with state_data (see above).
+	// a new mainloop iteration (i.e. uses re-entrancy), we detect
+	// this case and continue dispatching with state_data (see above).
 	// When the nested iteration is finished, state_data will be set to NULL
 	// and state to state_none.
 	// When control returns here then later on, the for loop will break (since
-	// state_data is NULL) and dispatching furthermore end immediately
-	// since state is state_none.
+	// state_data is NULL) immediately after the callback and dispatching
+	// furthermore end immediately since state is state_none.
 	// Important for this to work: the callback must always be the last
 	// thing we do in the loop body. By the time the callback returns
 	// the event source (d) might actually already be destroyed.
+	// When destroying an event source we also check whether it is currently
+	// set as state_data. If so we just set the next source of this type
+	// as state_data.
 	ml->state = state_dispatch_defer;
 	for(; d; d = ml->state_data) {
 		ml->state_data = d->next;
@@ -437,7 +452,8 @@ static bool dispatch_defer(struct mainloop* ml) {
 
 	// If the state is state_none now, a callback triggered a
 	// re-entrant iteration that continued/finished dispatching.
-	assert(ml->state == state_dispatch_defer || ml->state == state_none);
+	assert((ml->state == state_dispatch_defer || ml->state == state_none) &&
+		"Inconsistent state change");
 	return ml->state == state_dispatch_defer;
 }
 
@@ -470,7 +486,8 @@ static bool dispatch_timer(struct mainloop* ml) {
 		}
 	}
 
-	assert(ml->state == state_dispatch_timer || ml->state == state_none);
+	assert((ml->state == state_dispatch_timer || ml->state == state_none) &&
+		"Inconsistent state change");
 	return ml->state == state_dispatch_timer;
 }
 
@@ -483,11 +500,15 @@ static bool dispatch_io(struct mainloop* ml, struct pollfd* fds, unsigned n_fds)
 	ml->state = state_dispatch_io;
 	for(; io; io = ml->state_data) {
 		ml->state_data = io->next;
+
+		// this means that this source was added since the last event source
+		// preparation, i.e. this io's fd wasn't polled yet
 		if(io->fd_id == UINT_MAX) {
 			continue;
 		}
 
-		assert(io->fd_id < n_fds);
+		assert(io->fd_id < n_fds &&
+			"Not enough fds passed to mainloop_dispatch");
 		struct pollfd* fd = &fds[io->fd_id];
 
 		// Check here against fd->events again since the events might
@@ -498,7 +519,8 @@ static bool dispatch_io(struct mainloop* ml, struct pollfd* fds, unsigned n_fds)
 		}
 	}
 
-	assert(ml->state == state_dispatch_io || ml->state == state_none);
+	assert((ml->state == state_dispatch_io || ml->state == state_none) &&
+		"Inconsistent state change");
 	return ml->state == state_dispatch_io;
 }
 
@@ -513,27 +535,30 @@ static bool dispatch_custom(struct mainloop* ml, struct pollfd* fds,
 	for(; c; c = ml->state_data) {
 		ml->state_data = c->next;
 
-		// this means that this source was added since the last call
-		// to prepare (in non-dispatching state), i.e. this custom source
-		// was never prepared and its fds not polled
+		// this means that this source was added since the last event
+		// source preparation, i.e. this custom source
+		// was never prepared and its fds were not polled
 		if(c->fds_id == UINT_MAX) {
 			continue;
 		}
 
-		assert(c->fds_id + c->n_fds_last <= n_fds);
+		assert(c->fds_id + c->n_fds_last <= n_fds
+			&& "Not enough fds passed to mainloop_dispatch");
 		struct pollfd* fd = &fds[c->fds_id];
 		c->impl->dispatch(c, fd, c->n_fds_last);
 	}
 
-	assert(ml->state == state_dispatch_custom || ml->state == state_none);
+	assert((ml->state == state_dispatch_custom || ml->state == state_none) &&
+		"Inconsistent state change");
 	return ml->state == state_dispatch_custom;
 }
 
 void mainloop_dispatch(struct mainloop* ml, struct pollfd* fds, unsigned n_fds) {
 	assert(ml);
-	assert(fds || !n_fds);
+	assert((fds || !n_fds) &&
+		"fds = NULL but n_fds != 0 passed to mainloop_dispatch");
 	assert((ml->state == state_polled || is_dispatch_state(ml->state)) &&
-		"Invalid mainloop state to call dispatch");
+		"Invalid mainloop state for calling mainloop_dispatch");
 	unsigned depth = ml->dispatch_depth;
 	++ml->dispatch_depth;
 
@@ -575,9 +600,11 @@ int mainloop_iterate(struct mainloop* ml, bool block) {
 unsigned mainloop_query(struct mainloop* ml, struct pollfd* fds,
 		unsigned n_fds, int* timeout) {
 	assert(ml);
-	assert(timeout);
-	assert(!n_fds || fds);
-	assert(ml->state == state_prepared || is_dispatch_state(ml->state));
+	assert(timeout && "timeout = NULL passed to mainloop_query");
+	assert((!n_fds || fds) &&
+		"fds = NULL but n_fds != 0 passed to mainloop_query");
+	assert((ml->state == state_prepared || is_dispatch_state(ml->state)) &&
+		"Invalid mainloop state for calling mainloop_query");
 
 	// if dispatching isn't finished yet (i.e. is_dispatch_state_ml->state),
 	// we still have to return the valid fds so we receive them
@@ -687,15 +714,27 @@ void ml_io_destroy(struct ml_io* io) {
 
 	--ml->n_io;
 	if(ml->state_data == io) {
-		assert(io->mainloop->state == state_dispatch_io);
+		assert(ml->state == state_dispatch_io);
 		ml->state_data = io->next;
 	}
 
-	// TODO(optimiziation): we could simply set the fd to -1 here.
-	// potentially even re-using it later on when recreating a new io.
+	// in re-rentrant situations, the current fds array might be
+	// returned from query without being rebuild after this.
+	// mainloop_iterate itself won't poll but when the mainloop is
+	// integrated externally that might happen.
+	// Since the fd might be destroyed after this and no longer be
+	// valid, we just unset it here (poll ignores .fd = -1 entries)
+	if(io->fd_id != UINT_MAX) {
+		ml->fds[io->fd_id].fd = -1;
+	}
+
+	// TODO(optimiziation): we don't really have to set this here.
+	// could potentially even re-use it later on when creating a new io.
 	// sketch: build a linked list of free fd entries in fds by
 	// setting their fds to -(id of next free entry) and storing
 	// the first free entry (or -1) in mainloop.
+	// Could even store "free blocks sizes" and do the same for custom
+	// sources by using fds[i].events as block size.
 	ml->rebuild_fds = true;
 	destroy_io(io);
 }
@@ -900,11 +939,27 @@ void ml_custom_destroy(struct ml_custom* custom) {
 		return;
 	}
 
-	assert(custom->mainloop);
-	if(custom->mainloop->state_data == custom) {
-		assert(custom->mainloop->state == state_dispatch_custom);
-		custom->mainloop->state_data = custom->next;
+	struct mainloop* ml = custom->mainloop;
+	assert(ml);
+
+	if(ml->state_data == custom) {
+		assert(ml->state == state_dispatch_custom);
+		ml->state_data = custom->next;
 	}
+
+	// See ml_io_destroy for the reasoning. Basically: query (and external
+	// polling) might happen before rebuilding
+	assert(!custom->n_fds_last || custom->fds_id != UINT_MAX);
+	for(unsigned i = 0u; i < custom->n_fds_last; ++i) {
+		ml->fds[custom->fds_id + i].fd = -1;
+	}
+
+	// TODO: we might be able to avoid that in more situations; do more
+	// efficient internal re-allocation in the fds array.
+	if(custom->n_fds_last > 0) {
+		ml->rebuild_fds = true;
+	}
+
 	destroy_custom(custom);
 }
 
