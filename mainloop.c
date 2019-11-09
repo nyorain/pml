@@ -34,17 +34,9 @@
 // For custom event sources: simply add timeout to the time 'query' was
 // called. Not sure if this is really needed though.
 // Maybe change the custom interface to use timespec instead?
-// TODO: support other clocks than CLOCK_REALTIME, e.g. MONOTONIC
-// interface would probably look like:
-// void ml_timer_restart(struct ml_timer*, struct timespec*, clockid_t clock);
-// TODO: make callbacks mutable? shouldn't be a problem right?
-// also allow changing the implementation of a custom event source?
-// that doesn't make much sense though... Maybe rather keep these things
-// immutable?
-// TODO: abolish ml_io_flags and just use the POLLXXX values?
-// we use struct pollfd in the public interface already anyways...
-// also better handling (and documentation) of POLLERR/POLLHUP and
-// also POLLNVAL (handle that internally?)
+// TODO: this doesn't share code with the original pulseaudio implementation,
+// their copyright should probably be removed, right? The api is still roughly
+// similar (but also has major differences by now) though
 //
 // Ideas:
 // - the number of dispatched events from mainloop_iterate, allowing
@@ -55,6 +47,12 @@
 //   dispatch all.
 // - add idle event sources? or set a flag in defer sources whether
 //   they are urgent or not?
+// - aren't defer callbacks essentially timer callbacks with a time
+//   set to past timepoint (epoch 0)?
+//   would probably simplify library to treat them the same. Only good idea
+//   if it doesn't hurt performance though (atm timers aren't efficient).
+// - fd, timer and defer callbacks could probably be made mutable if there
+//   ever is a valid use case for it.
 //
 // Optimizations:
 // - implement the various caches and optimizations that keep track of
@@ -94,7 +92,7 @@ struct ml_io {
 	void* data;
 	ml_io_cb cb;
 	int fd;
-	enum ml_io_flags events;
+	unsigned events;
 	unsigned fd_id;
 };
 
@@ -103,6 +101,7 @@ struct ml_timer {
 	struct ml_timer* next;
 	struct mainloop* mainloop;
 	struct timespec time;
+	clockid_t clock;
 	bool enabled;
 	void* data;
 	ml_timer_cb cb;
@@ -156,7 +155,6 @@ struct mainloop {
 	int n_enabled_defered;
 
 	int64_t prepared_timeout;
-	int poll_ret;
 
 	// We mainly need this to continue dispatching events where we
 	// left off when dispatch is nested (re-entrancy).
@@ -186,22 +184,6 @@ static unsigned min(unsigned a, unsigned b) {
 // static unsigned max(unsigned a, unsigned b) {
 // 	return a > b ? a : b;
 // }
-
-static short map_flags_to_libc(enum ml_io_flags flags) {
-    return (short)
-        ((flags & ml_io_input ? POLLIN : 0) |
-         (flags & ml_io_output ? POLLOUT : 0) |
-         (flags & ml_io_hangup ? POLLHUP : 0) |
-         (flags & ml_io_error ? POLLERR : 0));
-}
-
-static enum ml_io_flags map_flags_from_libc(short flags) {
-    return
-        (flags & POLLIN ? ml_io_input : 0) |
-        (flags & POLLOUT ? ml_io_output : 0) |
-        (flags & POLLERR ? ml_io_error : 0) |
-        (flags & POLLHUP ? ml_io_hangup : 0);
-}
 
 static int64_t timespec_ms(const struct timespec* t) {
 	return 1000 * t->tv_sec + t->tv_nsec / (1000 * 1000);
@@ -346,10 +328,16 @@ void mainloop_prepare(struct mainloop* ml) {
 
 	// timers
 	struct timespec now;
-	clock_gettime(CLOCK_REALTIME, &now);
+	clockid_t clk = CLOCK_REALTIME;
+	clock_gettime(clk, &now);
 	for(struct ml_timer* t = ml->timer.first; t; t = t->next) {
 		if(!t->enabled) {
 			continue;
+		}
+
+		if(t->clock != clk) {
+			clockid_t clk = t->clock;
+			clock_gettime(clk, &now);
 		}
 
 		struct timespec diff = t->time;
@@ -371,7 +359,7 @@ void mainloop_prepare(struct mainloop* ml) {
 		unsigned i = 0u;
 		for(struct ml_io* io = ml->io.first; io; io = io->next) {
 			ml->fds[i].fd = io->fd;
-			ml->fds[i].events = map_flags_to_libc(io->events);
+			ml->fds[i].events = io->events;
 			io->fd_id = i;
 			++i;
 		}
@@ -404,17 +392,18 @@ int mainloop_poll(struct mainloop* ml, int timeout) {
 		return 0;
 	}
 
+	int ret;
 	// we ignore incoming signals
 	do {
-		ml->poll_ret = poll(ml->fds, ml->n_fds, timeout);
-	} while(ml->poll_ret < 0 && errno == EINTR);
+		ret = poll(ml->fds, ml->n_fds, timeout);
+	} while(ret < 0 && errno == EINTR);
 
-	if(ml->poll_ret < 0) {
+	if(ret < 0) {
 		fprintf(stderr, "mainloop poll: %s (%d)\n", strerror(errno), errno);
 	}
 
 	ml->state = state_polled;
-	return ml->poll_ret;
+	return ret;
 }
 
 static bool dispatch_defer(struct mainloop* ml) {
@@ -458,13 +447,14 @@ static bool dispatch_defer(struct mainloop* ml) {
 }
 
 static bool dispatch_timer(struct mainloop* ml) {
-	struct timespec now;
-	clock_gettime(CLOCK_REALTIME, &now);
-
 	struct ml_timer* t = ml->timer.first;
 	if(ml->state == state_dispatch_timer) {
 		t = ml->state_data;
 	}
+
+	struct timespec now;
+	clockid_t clk = CLOCK_REALTIME;
+	clock_gettime(clk, &now);
 
 	ml->state = state_dispatch_timer;
 	for(; t; t = ml->state_data) {
@@ -473,16 +463,17 @@ static bool dispatch_timer(struct mainloop* ml) {
 			continue;
 		}
 
+		if(t->clock != clk) {
+			clk = t->clock;
+			clock_gettime(clk, &now);
+		}
+
 		struct timespec diff = t->time;
 		timespec_subtract(&diff, &now);
 		if(timespec_ms(&diff) <= 0) {
 			assert(t->cb);
 			t->enabled = false;
-			// special case of keep-alive logic. If t is destroyed
-			// during this callback, we want the time parameter
-			// to remain valid.
-			const struct timespec copy = t->time;
-			t->cb(t, &copy);
+			t->cb(t);
 		}
 	}
 
@@ -510,12 +501,14 @@ static bool dispatch_io(struct mainloop* ml, struct pollfd* fds, unsigned n_fds)
 		assert(io->fd_id < n_fds &&
 			"Not enough fds passed to mainloop_dispatch");
 		struct pollfd* fd = &fds[io->fd_id];
+		assert(fd->fd >= 0);
 
 		// Check here against fd->events again since the events might
 		// have changed since we polled
-		enum ml_io_flags revents = map_flags_from_libc(fd->revents);
-		if(revents & io->events) {
-			io->cb(io, revents & io->events);
+		unsigned events = (io->events | POLLERR | POLLHUP | POLLNVAL);
+		unsigned revents = fd->revents & events;
+		if(revents) {
+			io->cb(io, revents);
 		}
 	}
 
@@ -663,9 +656,10 @@ void mainloop_for_each_custom(struct mainloop* ml, void (*cb)(struct ml_custom*)
 
 // ml_io
 struct ml_io* ml_io_new(struct mainloop* ml, int fd,
-		enum ml_io_flags events, ml_io_cb cb) {
+		unsigned events, ml_io_cb cb) {
 	assert(ml);
 	assert(fd >= 0);
+	assert((events & (POLLERR | POLLHUP | POLLNVAL)) == 0);
 	assert(cb);
 
 	struct ml_io* io = calloc(1, sizeof(*io));
@@ -739,12 +733,16 @@ void ml_io_destroy(struct ml_io* io) {
 	destroy_io(io);
 }
 
-void ml_io_events(struct ml_io* io, enum ml_io_flags events) {
+void ml_io_set_events(struct ml_io* io, unsigned events) {
 	assert(io);
 	io->events = events;
 	if(io->fd_id != UINT_MAX && !io->mainloop->rebuild_fds) {
-		io->mainloop->fds[io->fd_id].events = map_flags_to_libc(events);
+		io->mainloop->fds[io->fd_id].events = events;
 	}
+}
+
+unsigned ml_io_get_events(struct ml_io* io) {
+	return io->events;
 }
 
 struct mainloop* ml_io_get_mainloop(struct ml_io* io) {
@@ -759,14 +757,15 @@ ml_io_cb ml_io_get_cb(struct ml_io* io) {
 }
 
 // ml_timer
-struct ml_timer* ml_timer_new(struct mainloop* ml, const struct timespec* time,
-		ml_timer_cb cb) {
+struct ml_timer* ml_timer_new(struct mainloop* ml,
+		const struct timespec* time, ml_timer_cb cb) {
 	assert(ml);
 	assert(cb);
 
 	struct ml_timer* timer = calloc(1, sizeof(*timer));
 	timer->mainloop = ml;
 	timer->cb = cb;
+	timer->clock = CLOCK_REALTIME;
 	timer->enabled = time;
 	if(time) {
 		timer->time = *time;
@@ -783,12 +782,51 @@ struct ml_timer* ml_timer_new(struct mainloop* ml, const struct timespec* time,
 	return timer;
 }
 
-void ml_timer_restart(struct ml_timer* timer, const struct timespec* time) {
+void ml_timer_set_time(struct ml_timer* timer, struct timespec time) {
 	assert(timer);
-	timer->enabled = time;
-	if(time) {
-		timer->time = *time;
+	timer->enabled = true;
+	timer->time = time;
+}
+
+int ml_timer_set_time_rel(struct ml_timer* timer, struct timespec time) {
+	assert(timer);
+	int res = clock_gettime(timer->clock, &timer->time);
+	if(res != 0) {
+		timer->enabled = false;
+		printf("clock_gettime: %s (%d)\n", strerror(errno), errno);
+		return res;
 	}
+
+	timer->enabled = true;
+	timer->time.tv_nsec += time.tv_nsec;
+	timer->time.tv_sec += time.tv_sec;
+	return 0;
+}
+
+bool ml_timer_is_enabled(struct ml_timer* timer) {
+	assert(timer);
+	return timer->enabled;
+}
+
+void ml_timer_disable(struct ml_timer* timer) {
+	assert(timer);
+	timer->enabled = false;
+}
+
+void ml_timer_set_clock(struct ml_timer* timer, ml_clockid clock) {
+	assert(timer);
+	timer->clock = clock;
+	timer->enabled = false;
+}
+
+struct timespec ml_timer_get_time(struct ml_timer* timer) {
+	assert(timer);
+	return timer->time;
+}
+
+clockid_t ml_timer_get_clock(struct ml_timer* timer) {
+	assert(timer);
+	return timer->clock;
 }
 
 void ml_timer_set_data(struct ml_timer* timer, void* data) {

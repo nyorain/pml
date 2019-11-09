@@ -16,20 +16,18 @@
 bool run = true;
 unsigned count = 0;
 
-static void timer_cb(struct ml_timer* timer, const struct timespec* t) {
+static void timer_cb(struct ml_timer* timer) {
 	printf("timer\n");
 	// if(++count == 10) {
 	// 	run = false;
 	// }
 
-	struct timespec next;
-	clock_gettime(CLOCK_REALTIME, &next);
-	next.tv_sec += 5;
-	ml_timer_restart(timer, &next);
+	struct timespec next = { .tv_sec = 5 };
+	ml_timer_set_time_rel(timer, next);
 }
 
-static void fd_cb(struct ml_io* io, enum ml_io_flags revents) {
-	assert(revents == ml_io_input);
+static void fd_cb(struct ml_io* io, unsigned revents) {
+	assert(revents == POLLIN);
 	char buf[512];
 	int size = 511;
 	int ret;
@@ -64,19 +62,25 @@ struct paml_io_data {
 	struct pa_mainloop_api* api;
 };
 
-static void paml_io_cb(struct ml_io* io, enum ml_io_flags revents) {
+static void paml_io_cb(struct ml_io* io, unsigned revents) {
 	struct paml_io_data* iod = ml_io_get_data(io);
 	assert(iod->cb);
 
 	int fd = ml_io_get_fd(io);
-	int pa_revents = (pa_io_event_flags_t) revents; // they are the same
+	pa_io_event_flags_t pa_revents =
+		(revents & POLLIN ? PA_IO_EVENT_INPUT : 0) |
+		(revents & POLLOUT ? PA_IO_EVENT_OUTPUT : 0) |
+		(revents & POLLERR ? PA_IO_EVENT_ERROR : 0) |
+		(revents & POLLHUP ? PA_IO_EVENT_HANGUP : 0);
 	iod->cb(iod->api, (pa_io_event*) io, fd, pa_revents, iod->data);
 }
 
 static pa_io_event* paml_io_new(pa_mainloop_api* api, int fd,
 		pa_io_event_flags_t pa_events, pa_io_event_cb_t cb, void* data) {
 	struct mainloop* ml = (struct mainloop*) api->userdata;
-	enum ml_io_flags events = (enum ml_io_flags) pa_events;
+	unsigned events =
+		(pa_events & PA_IO_EVENT_INPUT ? POLLIN : 0) |
+		(pa_events & PA_IO_EVENT_OUTPUT ? POLLOUT : 0);
 	struct ml_io* io = ml_io_new(ml, fd, events, &paml_io_cb);
 
 	struct paml_io_data* iod = calloc(1, sizeof(*iod));
@@ -88,8 +92,10 @@ static pa_io_event* paml_io_new(pa_mainloop_api* api, int fd,
 }
 
 static void paml_io_enable(pa_io_event* e, pa_io_event_flags_t pa_events) {
-	enum ml_io_flags events = (enum ml_io_flags) pa_events;
-	ml_io_events((struct ml_io*) e, events);
+	unsigned events =
+		(pa_events & PA_IO_EVENT_INPUT ? POLLIN : 0) |
+		(pa_events & PA_IO_EVENT_OUTPUT ? POLLOUT : 0);
+	ml_io_set_events((struct ml_io*) e, events);
 }
 
 static void paml_io_free(pa_io_event* e) {
@@ -118,11 +124,12 @@ struct paml_time_data {
 	struct pa_mainloop_api* api;
 };
 
-static void paml_time_cb(struct ml_timer* t, const struct timespec* time) {
+static void paml_time_cb(struct ml_timer* t) {
 	struct paml_time_data* td = ml_timer_get_data(t);
 	assert(td->cb);
 
-	struct timeval tv = {time->tv_sec, time->tv_nsec / 1000};
+	struct timespec time = ml_timer_get_time(t);
+	struct timeval tv = {time.tv_sec, time.tv_nsec / 1000};
 	td->cb(td->api, (pa_time_event*) t, &tv, td->data);
 }
 
@@ -142,10 +149,10 @@ static pa_time_event* paml_time_new(pa_mainloop_api* api,
 
 static void paml_time_restart(pa_time_event* e, const struct timeval* tv) {
 	if(!tv) {
-		ml_timer_restart((struct ml_timer*) e, NULL);
+		ml_timer_disable((struct ml_timer*) e);
 	} else {
 		struct timespec ts = {tv->tv_sec, 1000 * tv->tv_usec};
-		ml_timer_restart((struct ml_timer*) e, &ts);
+		ml_timer_set_time((struct ml_timer*) e, ts);
 	}
 }
 
@@ -344,14 +351,13 @@ int main() {
 	struct mainloop* ml = mainloop_new();
 
 	// ml_timer source: triggers once every second
-	struct timespec time;
-	clock_gettime(CLOCK_REALTIME, &time);
-	time.tv_sec += 10;
-	struct ml_timer* timer = ml_timer_new(ml, &time, &timer_cb);
-	(void) timer;
+	struct ml_timer* timer = ml_timer_new(ml, NULL, &timer_cb);
+	struct timespec time = { .tv_sec = 5 };
+	ml_timer_set_clock(timer, CLOCK_MONOTONIC);
+	ml_timer_set_time_rel(timer, time);
 
 	// ml_io source: listing for input to stdin
-	struct ml_io* io = ml_io_new(ml, STDIN_FILENO, ml_io_input, &fd_cb);
+	struct ml_io* io = ml_io_new(ml, STDIN_FILENO, POLLIN, &fd_cb);
 	(void) io;
 
 	// ml_custom source: wrap glib's mainloop to use playerctl

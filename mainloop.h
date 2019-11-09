@@ -34,8 +34,8 @@
 #include <stdbool.h>
 #include <time.h>
 
-struct timespec;
-struct pollfd;
+struct timespec; // <time.h> with _POSIX_C_SOURCE
+struct pollfd; // <poll.h>
 
 // Opaque structure representing all information about the mainloop.
 struct mainloop;
@@ -124,24 +124,19 @@ struct ml_timer;
 struct ml_defer;
 struct ml_custom;
 
-// Correspond to the POSIX POLL* values in poll.h
-enum ml_io_flags {
-    ml_io_none = 0,
-    ml_io_input = 1,
-    ml_io_output = 2,
-    ml_io_hangup = 4,
-    ml_io_error = 8
-};
-
 // ml_io represents an event source for a single fd.
-typedef void (*ml_io_cb)(struct ml_io* e, enum ml_io_flags revents);
+// events and revents are flags from the POLLXXX values defined in <poll.h>.
+// As with polling, the callback might be called with POLLERR, POLLHUP or
+// POLLNVAL even though those values are not valid as events.
+typedef void (*ml_io_cb)(struct ml_io* e, unsigned revents);
 
-struct ml_io* ml_io_new(struct mainloop*, int fd, enum ml_io_flags events, ml_io_cb);
+struct ml_io* ml_io_new(struct mainloop*, int fd, unsigned events, ml_io_cb);
 void ml_io_set_data(struct ml_io*, void*);
 void* ml_io_get_data(struct ml_io*);
 int ml_io_get_fd(struct ml_io*);
 void ml_io_destroy(struct ml_io*);
-void ml_io_events(struct ml_io*, enum ml_io_flags);
+void ml_io_set_events(struct ml_io*, unsigned events);
+unsigned ml_io_get_events(struct ml_io*);
 ml_io_cb ml_io_get_cb(struct ml_io*);
 struct mainloop* ml_io_get_mainloop(struct ml_io*);
 
@@ -151,16 +146,32 @@ struct mainloop* ml_io_get_mainloop(struct ml_io*);
 // The timer callback is called with the timespec at which it should have
 // been triggered (since timers are always delayed by a small amount of
 // time).
-typedef void (*ml_timer_cb)(struct ml_timer* e, const struct timespec*);
+typedef void (*ml_timer_cb)(struct ml_timer* e);
+typedef int ml_clockid; // clockid_t requires to define _POSIX_C_SOURCE
 
-// Pass a null timespec to disable the timer.
-struct ml_timer* ml_timer_new(struct mainloop*, const struct timespec*, ml_timer_cb);
-// Pass a null timespec to disable the timer.
-void ml_timer_restart(struct ml_timer*, const struct timespec*);
+// Pass a null timespec to initially disable the timer.
+// The initial clock is CLOCK_REALTIME (i.e. time since epoch).
+struct ml_timer* ml_timer_new(struct mainloop*,
+	const struct timespec*, ml_timer_cb);
+// Enables the timer.
+void ml_timer_set_time(struct ml_timer*, struct timespec);
+// Enables the timer. In this case, timespec is relative, using the
+// timer's clock. Returns the return value from clock_gettime.
+// If clock_gettime returns an error, the timer gets disabled.
+int ml_timer_set_time_rel(struct ml_timer*, struct timespec);
+// This will automatically disable the timer since the previously
+// set timespec doesn't sense anymore.
+void ml_timer_set_clock(struct ml_timer*, ml_clockid);
 void ml_timer_set_data(struct ml_timer*, void*);
 void* ml_timer_get_data(struct ml_timer*);
 void ml_timer_destroy(struct ml_timer*);
 ml_timer_cb ml_timer_get_cb(struct ml_timer*);
+// Disables the timer no matter what time is currently set.
+void ml_timer_disable(struct ml_timer*);
+bool ml_timer_is_enabled(struct ml_timer*);
+// Will return undefined value if timer is disabled.
+struct timespec ml_timer_get_time(struct ml_timer*);
+ml_clockid ml_timer_get_clock(struct ml_timer*);
 struct mainloop* ml_timer_get_mainloop(struct ml_timer*);
 
 // ml_defer
@@ -272,7 +283,7 @@ struct mainloop* ml_custom_get_mainloop(struct ml_custom*);
 // Otherwise it is perfectly valid to destroy an event source from
 // within its own callback. It just must not be used in any way afterwards.
 //
-// Enabling/disabling defer sources or restarting timers takes effect
+// Enabling/disabling defer sources or changing a timer's time takes effect
 // immediately. There won't be any delayed callbacks afterwards from a previuos
 // mainloop iteration level. The same is true for fd events, there won't
 // be any delayed false positives for events that weren't requested.
