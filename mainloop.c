@@ -13,7 +13,15 @@
 // Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public
-// License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
+// License along with posix_mainloop; if not, see <http://www.gnu.org/licenses/>.
+//
+// NOTE: this doesn't share code with the original pulseaudio implementation,
+// their copyright should probably be removed, right? I looked at their
+// code for the initial sketch of this library but especially since the
+// re-entrancy rework, this implementation is fundamentally different.
+// The api is still roughly similar (but also has major differences by now)
+// though. Not sure whether or not this is actually still a derived work,
+// keeping their license for now.
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -28,16 +36,6 @@
 #include <assert.h>
 #include <poll.h>
 
-// TODO: support less timer delay by preparing the nearest timespec instead
-// of already calculating the resulting timeout interval.
-// And then calculate the timeout from that at the end of prepare.
-// For custom event sources: simply add timeout to the time 'query' was
-// called. Not sure if this is really needed though.
-// Maybe change the custom interface to use timespec instead?
-// TODO: this doesn't share code with the original pulseaudio implementation,
-// their copyright should probably be removed, right? The api is still roughly
-// similar (but also has major differences by now) though
-//
 // Ideas:
 // - the number of dispatched events from mainloop_iterate, allowing
 //   to dispatch *all* pending events (call it until the number if 0).
@@ -53,6 +51,12 @@
 //   if it doesn't hurt performance though (atm timers aren't efficient).
 // - fd, timer and defer callbacks could probably be made mutable if there
 //   ever is a valid use case for it.
+// - support less timer delay by preparing the nearest timespec instead
+//   of already calculating the resulting timeout interval.
+//   And then calculate the timeout from that at the end of prepare.
+//   For custom event sources: simply add timeout to the time 'query' was
+//   called. Not sure if this is really needed though.
+//   Maybe change the custom interface to use timespec instead?
 //
 // Optimizations:
 // - implement the various caches and optimizations that keep track of
@@ -66,13 +70,13 @@
 // - implement (and use in mainloop_iterate):
 // - Maybe also seperate mainloop.n_fds and capacity of mainloop.fds to
 //   avoid reallocation in some cases.
-// ```
-// // Like `mainloop_dispatch` but additionally takes the return code from ret.
-// // This is only used for internal optimizations such as not even checking
-// // the returned fds if poll returned an error or 0.
-// void mainloop_dispatch_with_poll_code(struct mainloop*,
-// 	struct pollfd* fds, unsigned n_fds, int poll_code);
-// ```
+//   ```
+//   // Like `mainloop_dispatch` but additionally takes the return code from ret.
+//   // This is only used for internal optimizations such as not even checking
+//   // the returned fds if poll returned an error or 0.
+//   void mainloop_dispatch_with_poll_code(struct mainloop*,
+//   	struct pollfd* fds, unsigned n_fds, int poll_code);
+//   ```
 
 enum state {
 	state_none = 0,
@@ -992,8 +996,8 @@ void ml_custom_destroy(struct ml_custom* custom) {
 		ml->fds[custom->fds_id + i].fd = -1;
 	}
 
-	// TODO: we might be able to avoid that in more situations; do more
-	// efficient internal re-allocation in the fds array.
+	// TODO(optimization) we might be able to avoid that in more situations;
+	// do more efficient internal re-allocation in the fds array.
 	if(custom->n_fds_last > 0) {
 		ml->rebuild_fds = true;
 	}

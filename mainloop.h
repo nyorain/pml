@@ -13,21 +13,21 @@
 // Lesser General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public
-// License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
-//
-// Refactored version of the pulse audio main loop implementation.
-// Seemed nice to me since it has a rather clean and minimal interface,
-// is quite flexible and has no external dependencies. Does not use
-// any linux specifics (such as epoll), relies only on posix functionality.
-// For more advanced usage scenarios, linux specifics (epoll) can improve
-// performance though (e.g. many hundreds file descriptors which are not
-// changed often), see e.g. sd-event, libuv or libev.
-// See pulseaudio src/pulse/mainloop.c and <pulse/mainloop-api.h> for
-// the original implementation.
-// Added custom event sources that allow integration with pretty much
-// anything (you could poll multiple event loops like this). Also
-// changed some of the interfaces to be even more minimalistic to use
-// and easier to integrate with stuff.
+// License along with posix_mainloop; if not, see <http://www.gnu.org/licenses/>.
+
+// Simple mainloop implementation working using poll and only standard POSIX
+// primitives. For more advanced usage scenarios, linux specifics (epoll) can
+// improve performance though (e.g. many hundreds file descriptors which are
+// not changed often), see e.g. sd-event, libuv or libev.
+// Initially inspired by the pulse audio mainloop (that's why those people are
+// still in the license) since i really liked its interface, see
+// src/pulse/mainloop.c and <pulse/mainloop-api.h> for the original
+// implementation.
+// By now, this doesn't really share much (any?) code with their
+// implementation anymore and offers slightly different features though.
+// Removed some of their features that felt useless for simplicity and
+// added custom event sources, support for re-entrancy, timer clocks
+// and easy intergration with external loops.
 
 #pragma once
 
@@ -40,12 +40,12 @@ struct pollfd; // <poll.h>
 // Opaque structure representing all information about the mainloop.
 struct mainloop;
 struct ml_io;
-struct ml_defer;
 struct ml_timer;
+struct ml_defer;
 struct ml_custom;
 
 // Creates a new, empty mainloop.
-// Must be freed using mainloop_destroy.
+// Must be destroyed using mainloop_destroy.
 struct mainloop* mainloop_new(void);
 
 // Destroying the mainloop will automatically destroy all sources.
@@ -119,10 +119,6 @@ void mainloop_for_each_timer(struct mainloop*, void (*)(struct ml_timer*));
 void mainloop_for_each_defer(struct mainloop*, void (*)(struct ml_defer*));
 void mainloop_for_each_custom(struct mainloop*, void (*)(struct ml_custom*));
 
-struct ml_io;
-struct ml_timer;
-struct ml_defer;
-struct ml_custom;
 
 // ml_io represents an event source for a single fd.
 // events and revents are flags from the POLLXXX values defined in <poll.h>.
@@ -139,6 +135,7 @@ void ml_io_set_events(struct ml_io*, unsigned events);
 unsigned ml_io_get_events(struct ml_io*);
 ml_io_cb ml_io_get_cb(struct ml_io*);
 struct mainloop* ml_io_get_mainloop(struct ml_io*);
+
 
 // ml_timer
 // The passed timerspec values represent the timepoints using CLOCK_REALTIME
@@ -174,7 +171,11 @@ struct timespec ml_timer_get_time(struct ml_timer*);
 ml_clockid ml_timer_get_clock(struct ml_timer*);
 struct mainloop* ml_timer_get_mainloop(struct ml_timer*);
 
-// ml_defer
+
+// ml_defer represents a single callback that is called during the
+// next iteration of the mainloop. It won't be automatically disabled
+// so for one-shot events, destroy or disable the ml_defer in the
+// callback.
 typedef void (*ml_defer_cb)(struct ml_defer* e);
 
 struct ml_defer* ml_defer_new(struct mainloop*, ml_defer_cb);
@@ -184,6 +185,7 @@ void* ml_defer_get_data(struct ml_defer*);
 void ml_defer_destroy(struct ml_defer*);
 ml_defer_cb ml_defer_get_cb(struct ml_defer*);
 struct mainloop* ml_defer_get_mainloop(struct ml_defer*);
+
 
 // ml_custom
 // Useful to integrate other mainloops, e.g. glib.
