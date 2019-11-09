@@ -22,11 +22,16 @@ add_project_arguments(
 )
 
 pml_inc = include_directories('.')
-pml_lib = library('pml', ['pml.c'], install: true)
+pml_lib = library('pml',
+	['pml.c'],
+	install: true,
+	version: meson.project_version(),
+)
 pml_dep = declare_dependency(
 	include_directories: pml_inc,
 	version: meson.project_version(),
-	link_with: pml_lib)
+	link_with: pml_lib
+)
 
 install_headers('pml.h')
 
@@ -36,7 +41,8 @@ pkg.generate(
 	name: 'pml',
 	version: meson.project_version(),
 	url: 'https://github.com/nyorain/pml',
-	description: 'Simple POSIX mainloop for C')
+	description: 'Simple POSIX mainloop for C'
+)
 
 # other stuff, examples & tests
 if get_option('examples')
@@ -48,13 +54,13 @@ if get_option('examples')
 endif
 
 if get_option('tests')
-	mltest_nested = executable('test-nested',
+	test_nested = executable('test-nested',
 		'test-nested.c',
 		dependencies: [pml_dep])
-	test('nested', mltest_nested)
+	test('nested', test_nested)
 
-	mltest_nested_destroy = executable('test-nested-destroy',
+	test_nested_destroy = executable('test-nested-destroy',
 		'test-nested-destroy.c',
 		dependencies: [pml_dep])
-	test('nested-destroy', mltest_nested_destroy)
+	test('nested-destroy', test_nested_destroy)
 endif
