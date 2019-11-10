@@ -230,6 +230,28 @@ void pml_custom_destroy(struct pml_custom*);
 const struct pml_custom_impl* pml_custom_get_impl(struct pml_custom*);
 struct pml* pml_custom_get_pml(struct pml_custom*);
 
+
+// A pml_check source is a source that is called every iteration at
+// the end of preparation (and not during the dispatch phase as
+// all other event sources).
+// The handler returns whether an event was processed, i.e. something
+// could have changed, in which case all check sources are triggered
+// again. This is repeated until no check source reports a dispatched
+// event. This is mainly useful for processing potentially buffered
+// data before polling shared fds, e.g. of ipc libraries.
+// Re-entrancy is allowed during the check callback.
+// When any check event reported a dispatched event, polling will
+// not block since newly added sources will only be considered during
+// the next iteration.
+struct pml_check;
+typedef bool (*pml_check_cb)(struct pml_check* e);
+
+struct pml_check* pml_check_new(struct pml*, pml_check_cb);
+void pml_check_destroy(struct pml_check*);
+void pml_check_set_data(struct pml_check*, void*);
+void* pml_check_get_data(struct pml_check*);
+struct pml* pml_check_get_pml(struct pml_check*);
+
 #ifdef __cplusplus
 }
 #endif

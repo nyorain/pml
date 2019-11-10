@@ -57,6 +57,8 @@
 //   For custom event sources: simply add timeout to the time 'query' was
 //   called. Not sure if this is really needed though.
 //   Maybe change the custom interface to use timespec instead?
+// - it's kinda weird that the defer source has to be disabled.
+//   i guess giving it one-shot semantics is more expected
 //
 // Optimizations:
 // - implement the various caches and optimizations that keep track of
@@ -81,6 +83,7 @@
 enum state {
 	state_none = 0,
 	state_preparing,
+	state_checking,
 	state_prepared,
 	state_polled,
 	state_dispatch_timer,
@@ -130,6 +133,14 @@ struct pml_custom {
 	unsigned n_fds_last;
 };
 
+struct pml_check {
+	struct pml_check* prev;
+	struct pml_check* next;
+	struct pml* pml;
+	void* data;
+	pml_check_cb cb;
+};
+
 struct pml {
 	unsigned n_io; // only alive ones
 	unsigned n_fds;
@@ -154,6 +165,11 @@ struct pml {
 		struct pml_custom* first;
 		struct pml_custom* last;
 	} custom;
+
+	struct {
+		struct pml_check* first;
+		struct pml_check* last;
+	} check;
 
 	bool rebuild_fds;
 	int n_enabled_defered;
@@ -268,109 +284,163 @@ void pml_destroy(struct pml* ml) {
 		free(c);
 		c = n;
 	}
+	for(struct pml_check* c = ml->check.first; c;) {
+		struct pml_check* n = c->next;
+		free(c);
+		c = n;
+	}
 
 	free(ml);
 }
 
+static void prepare_check(struct pml* ml) {
+	struct pml_check* check = ml->check.first;
+	if(ml->state == state_checking) {
+		ml->prepared_timeout = 0;
+		check = ml->state_data;
+	}
+
+	ml->state = state_checking;
+	while(true) {
+		bool again = false;
+		for(; check; check = ml->state_data) {
+			ml->state_data = check->next;
+			again |= check->cb(check);
+		}
+
+		if(!again || ml->state == state_none) {
+			break;
+		}
+
+		// any check source dispatched events and we did no re-entrant
+		// iteration. Check all sources again. But also set the timeout to
+		// 0 since new sources might have been added, we don't want
+		// to wait for poll until re-preparing.
+		check = ml->check.first;
+		ml->prepared_timeout = 0;
+	}
+
+	assert(ml->state == state_checking || ml->state == state_none);
+	ml->state_data = NULL;
+}
+
 void pml_prepare(struct pml* ml) {
 	assert(ml);
-	assert((ml->state == state_none || is_dispatch_state(ml->state)) &&
+	assert((ml->state == state_none ||
+				ml->state == state_checking ||
+				is_dispatch_state(ml->state)) &&
 		"Invalid state of mainloop for pml_prepare");
 
 	// dispatching isn't finished yet, just continue it
 	// pml_poll will detect that as well, but we set the timeout
 	// to zero so we can return it from pml_query
-	if(ml->state != state_none) {
+	if(is_dispatch_state(ml->state)) {
 		ml->prepared_timeout = 0;
+		return;
+	} else if(ml->state == state_checking) {
+		prepare_check(ml);
+		ml->state = state_prepared;
+		ml->state_data = NULL;
 		return;
 	}
 
-	ml->state = state_preparing;
+	while(ml->state == state_none) {
+		ml->state = state_preparing;
 
-	ml->prepared_timeout = -1;
-	if(ml->n_enabled_defered) {
-		ml->prepared_timeout = 0;
-	}
-
-	// prepare custom sources
-	unsigned n_fds = ml->n_io;
-	for(struct pml_custom* c = ml->custom.first; c; c = c->next) {
-		if(c->impl->prepare) {
-			c->impl->prepare(c);
-		}
-
-		unsigned count = 0;
-		struct pollfd* fds = NULL;
-		if(!ml->rebuild_fds && n_fds < ml->n_fds) {
-			fds = &ml->fds[n_fds];
-			count = ml->n_fds - n_fds;
-		}
-
-		int timeout;
-		count = c->impl->query(c, fds, count, &timeout);
-		assert(timeout >= -1);
-
-		if(timeout != -1 && (ml->prepared_timeout == -1 ||
-				timeout < ml->prepared_timeout)) {
-			ml->prepared_timeout = timeout;
-		}
-
-		c->n_fds_last = count;
-		n_fds += count;
-	}
-
-	// timers
-	struct timespec now;
-	clockid_t clk = CLOCK_REALTIME;
-	clock_gettime(clk, &now);
-	for(struct pml_timer* t = ml->timer.first; t; t = t->next) {
-		if(!t->enabled) {
-			continue;
-		}
-
-		if(t->clock != clk) {
-			clockid_t clk = t->clock;
-			clock_gettime(clk, &now);
-		}
-
-		struct timespec diff = t->time;
-		timespec_subtract(&diff, &now);
-		int64_t ms = timespec_ms(&diff);
-		if(ms < 0) {
+		ml->prepared_timeout = -1;
+		if(ml->n_enabled_defered) {
 			ml->prepared_timeout = 0;
-		} else if(ml->prepared_timeout == -1 || ms < ml->prepared_timeout) {
-			ml->prepared_timeout = ms;
-		}
-	}
-
-	// rebuild fds if needed
-	if(ml->rebuild_fds || n_fds > ml->n_fds) {
-		ml->rebuild_fds = false;
-		ml->fds = realloc(ml->fds, n_fds * sizeof(*ml->fds));
-		ml->n_fds = n_fds;
-
-		unsigned i = 0u;
-		for(struct pml_io* io = ml->io.first; io; io = io->next) {
-			ml->fds[i].fd = io->fd;
-			ml->fds[i].events = io->events;
-			io->fd_id = i;
-			++i;
 		}
 
+		// prepare custom sources
+		unsigned n_fds = ml->n_io;
 		for(struct pml_custom* c = ml->custom.first; c; c = c->next) {
-			int timeout;
-			unsigned count = c->impl->query(c, &ml->fds[i], c->n_fds_last, &timeout);
-			assert(count == c->n_fds_last &&
-				"Custom event source changed number of fds without prepare");
+			if(c->impl->prepare) {
+				c->impl->prepare(c);
+			}
 
-			c->fds_id = i;
-			i += count;
+			unsigned count = 0;
+			struct pollfd* fds = NULL;
+			if(!ml->rebuild_fds && n_fds < ml->n_fds) {
+				fds = &ml->fds[n_fds];
+				count = ml->n_fds - n_fds;
+			}
+
+			int timeout;
+			count = c->impl->query(c, fds, count, &timeout);
+			assert(timeout >= -1);
+
+			if(timeout != -1 && (ml->prepared_timeout == -1 ||
+					timeout < ml->prepared_timeout)) {
+				ml->prepared_timeout = timeout;
+			}
+
+			c->n_fds_last = count;
+			n_fds += count;
 		}
 
-		assert(i == ml->n_fds);
+		// timers
+		struct timespec now;
+		clockid_t clk = CLOCK_REALTIME;
+		clock_gettime(clk, &now);
+		for(struct pml_timer* t = ml->timer.first; t; t = t->next) {
+			if(!t->enabled) {
+				continue;
+			}
+
+			if(t->clock != clk) {
+				clockid_t clk = t->clock;
+				clock_gettime(clk, &now);
+			}
+
+			struct timespec diff = t->time;
+			timespec_subtract(&diff, &now);
+			int64_t ms = timespec_ms(&diff);
+			if(ms < 0) {
+				ml->prepared_timeout = 0;
+			} else if(ml->prepared_timeout == -1 || ms < ml->prepared_timeout) {
+				ml->prepared_timeout = ms;
+			}
+		}
+
+		// rebuild fds if needed
+		if(ml->rebuild_fds || n_fds > ml->n_fds) {
+			ml->rebuild_fds = false;
+			ml->fds = realloc(ml->fds, n_fds * sizeof(*ml->fds));
+			ml->n_fds = n_fds;
+
+			unsigned i = 0u;
+			for(struct pml_io* io = ml->io.first; io; io = io->next) {
+				ml->fds[i].fd = io->fd;
+				ml->fds[i].events = io->events;
+				io->fd_id = i;
+				++i;
+			}
+
+			for(struct pml_custom* c = ml->custom.first; c; c = c->next) {
+				int timeout;
+				unsigned count = c->impl->query(c, &ml->fds[i], c->n_fds_last, &timeout);
+				assert(count == c->n_fds_last &&
+					"Custom event source changed number of fds without prepare");
+
+				c->fds_id = i;
+				i += count;
+			}
+
+			assert(i == ml->n_fds);
+		}
+
+		assert(ml->state == state_preparing);
+
+		// this will set the state to checking. If it is still checking
+		// in the end, no re-entrant interation happened and we will
+		// break the loop here. It it was reset to state_none, a full
+		// iteration happened and we have to prepare again since something
+		// might have changed (and 'dispatch' was called on the custom
+		// sources).
+		prepare_check(ml);
 	}
 
-	assert(ml->state == state_preparing);
 	ml->state = state_prepared;
 	return;
 }
@@ -381,7 +451,7 @@ int pml_poll(struct pml* ml, int timeout) {
 		"Invalid mainloop state for calling pml_poll");
 
 	// dispatching not finished yet, we can skip polling.
-	if(ml->state != state_prepared) {
+	if(is_dispatch_state(ml->state)) {
 		return 0;
 	}
 
@@ -1002,4 +1072,54 @@ struct pml* pml_custom_get_pml(struct pml_custom* custom) {
 const struct pml_custom_impl* pml_custom_get_impl(struct pml_custom* custom) {
 	assert(custom);
 	return custom->impl;
+}
+
+// pml_check
+struct pml_check* pml_check_new(struct pml* pml, pml_check_cb cb) {
+	assert(pml);
+	assert(cb);
+
+	struct pml_check* check = calloc(1, sizeof(*check));
+	check->pml = pml;
+	check->cb = cb;
+
+	if(!pml->check.first) {
+		pml->check.first = check;
+	} else {
+		pml->check.last->next = check;
+		check->prev = pml->check.last;
+	}
+	pml->check.last = check;
+	return check;
+}
+
+void pml_check_destroy(struct pml_check* check) {
+	if(!check) {
+		return;
+	}
+
+	struct pml* pml = check->pml;
+	assert(pml);
+	if(pml->state_data == check) {
+		assert(pml->state == state_checking);
+		pml->state_data = check->next;
+	}
+
+	if(pml->check.first == check) pml->check.first = check->next;
+	if(pml->check.last == check) pml->check.last = check->prev;
+	if(check->next) check->next->prev = check->prev;
+	if(check->prev) check->prev->next = check->next;
+	free(check);
+}
+
+void pml_check_set_data(struct pml_check* check, void* data) {
+	assert(check);
+	check->data = data;
+}
+void* pml_check_get_data(struct pml_check* check) {
+	assert(check);
+	return check->data;
+}
+struct pml* pml_check_get_pml(struct pml_check* check) {
+	return check->pml;
 }
